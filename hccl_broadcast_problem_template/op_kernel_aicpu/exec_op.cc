@@ -303,12 +303,9 @@ HcclResult SubmitSendTile(ThreadHandle thread, const ChannelInfo &channel, const
     void *remoteSlot = nullptr;
     CHK_RET(GetSlotAddress(resource, plan, tile, resource.localBuffer.addr, resource.localBuffer.size, localSlot));
     CHK_RET(GetSlotAddress(resource, plan, tile, channel.remoteCclMem.addr, channel.remoteCclMem.size, remoteSlot));
-    // 发送协议：
-    //   1. 等接收方声明目标槽位空闲；
-    //   2. Write + Fence，确保数据到达后再发 DATA_READY；
-    //   3. 再等接收方复制完成，之后发送方才能复用本地源槽位。
-    CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(thread, channel.handle,
-        SlotConsumedNotifyIndex(plan, tile.windowIndex), CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
+    // Peer 槽位首次使用时天然空闲；同一 window 再次使用前，上一次调用末尾
+    // 已等待 SLOT_CONSUMED。因此发送前不再增加一组 Record/Wait，避免任务图
+    // 以跨 rank Wait 开头。Write + Fence 完成后才发布 DATA_READY。
     CHK_RET(CheckHcommRet(HcommWriteOnThread(thread, channel.handle, remoteSlot, localSlot, tile.bytes),
         "HcommWriteOnThread"));
     CHK_RET(CheckHcommRet(HcommChannelFenceOnThread(thread, channel.handle), "HcommChannelFenceOnThread"));
@@ -338,11 +335,55 @@ HcclResult SubmitReceiveTileData(ThreadHandle thread, const ChannelInfo &channel
 HcclResult SubmitReceiveTile(ThreadHandle thread, const ChannelInfo &channel, const OpParam &param,
     const AlgResourceCtx &resource, const ExecutionPlan &plan, const TileDesc &tile)
 {
-    CHK_RET(SubmitReceiveTileData(thread, channel, param, resource, plan, tile));
-    // 普通 peer 接收完成后立即归还槽位；owner 从 root 接收时不能立即归还，
-    // 必须等自己的 Tile fanout 给所有 peer 后再 ACK root。
+    void *localSlot = nullptr;
+    CHK_RET(GetSlotAddress(resource, plan, tile, resource.localBuffer.addr,
+        resource.localBuffer.size, localSlot));
+    // Peer 接收方只需等待 DATA_READY。复制完成后的 SLOT_CONSUMED 既确认本轮
+    // 数据已使用，也为发送方下一次复用同一个 window 提供许可。
+    CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(thread, channel.handle,
+        DataReadyNotifyIndex(tile.windowIndex), CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
+    CHK_RET(CheckHcommRet(HcommLocalCopyOnThread(thread, OffsetPtr(param.outputPtr, tile.offset),
+        localSlot, tile.bytes), "HcommLocalCopyOnThread"));
     CHK_RET(CheckHcommRet(HcommChannelNotifyRecordOnThread(thread, channel.handle,
         SlotConsumedNotifyIndex(plan, tile.windowIndex)), "HcommChannelNotifyRecordOnThread"));
+    return HCCL_SUCCESS;
+}
+
+HcclResult SubmitBidirectionalPeerExchange(const OpParam &param, const AlgResourceCtx &resource,
+    const ExecutionPlan &plan, ThreadHandle worker, const ChannelInfo &channel,
+    const TileDesc &ownTile, const TileDesc &peerTile)
+{
+    void *ownLocalSlot = nullptr;
+    void *ownRemoteSlot = nullptr;
+    void *peerLocalSlot = nullptr;
+    CHK_RET(GetSlotAddress(resource, plan, ownTile, resource.localBuffer.addr,
+        resource.localBuffer.size, ownLocalSlot));
+    CHK_RET(GetSlotAddress(resource, plan, ownTile, channel.remoteCclMem.addr,
+        channel.remoteCclMem.size, ownRemoteSlot));
+    CHK_RET(GetSlotAddress(resource, plan, peerTile, resource.localBuffer.addr,
+        resource.localBuffer.size, peerLocalSlot));
+
+    // 双方执行完全相同的顺序，并且在任何跨 rank Wait 之前先发送自己的
+    // Tile。首次使用的 peer 槽位天然空闲；窗口复用由本函数末尾等待上一轮
+    // SLOT_CONSUMED 保证。Fence 建立 Write 与 DATA_READY 的先后关系。
+    CHK_RET(CheckHcommRet(HcommWriteOnThread(worker, channel.handle, ownRemoteSlot,
+        ownLocalSlot, ownTile.bytes), "HcommWriteOnThread"));
+    CHK_RET(CheckHcommRet(HcommChannelFenceOnThread(worker, channel.handle),
+        "HcommChannelFenceOnThread"));
+    CHK_RET(CheckHcommRet(HcommChannelNotifyRecordOnThread(worker, channel.handle,
+        DataReadyNotifyIndex(ownTile.windowIndex)), "HcommChannelNotifyRecordOnThread"));
+
+    // 收到对端 Tile 后复制到最终用户 Buffer，并发送 SLOT_CONSUMED。最后的
+    // Wait 保证 ownTile 对应的远端槽位已被消费，下一轮才可覆盖该 window。
+    CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
+        DataReadyNotifyIndex(peerTile.windowIndex), CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
+    CHK_RET(CheckHcommRet(HcommLocalCopyOnThread(worker, OffsetPtr(param.outputPtr, peerTile.offset),
+        peerLocalSlot, peerTile.bytes), "HcommLocalCopyOnThread"));
+    CHK_RET(CheckHcommRet(HcommChannelNotifyRecordOnThread(worker, channel.handle,
+        SlotConsumedNotifyIndex(plan, peerTile.windowIndex)), "HcommChannelNotifyRecordOnThread"));
+    CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
+        SlotConsumedNotifyIndex(plan, ownTile.windowIndex), CUSTOM_TIMEOUT),
+        "HcommChannelNotifyWaitOnThread"));
     return HCCL_SUCCESS;
 }
 
@@ -419,6 +460,27 @@ HcclResult NotifyWorkerDone(ThreadHandle worker, ThreadHandle mainThread, uint32
         "HcommThreadNotifyRecordOnThread");
 }
 
+HcclResult StartAllWorkers(const AlgResourceCtx &resource)
+{
+    // Checker 和真实 TS 都从 AICPU 主线程开始推进任务。显式建立
+    // main -> worker 的启动边，否则主线程首先执行 WaitAllWorkers，而 worker
+    // 流只有末尾的 worker -> main 完成边，整个子图会形成不可达的闭环。
+    //
+    // 每个 worker 的 Notify 0 已用于逐 stripe 启动；这里使用 workerCount
+    // 作为一次性的启动索引。资源侧为每个线程申请了 workerCount + 1 个
+    // Notify，因此该索引始终有效，且不会与主线程上的完成索引冲突。
+    uint32_t launchNotifyIndex = resource.workerCount;
+    for (uint32_t workerIndex = 1; workerIndex <= resource.workerCount; ++workerIndex) {
+        CHK_RET(CheckHcommRet(HcommThreadNotifyRecordOnThread(resource.aicpuThread,
+            resource.threads[workerIndex], launchNotifyIndex), "HcommThreadNotifyRecordOnThread"));
+    }
+    for (uint32_t workerIndex = 1; workerIndex <= resource.workerCount; ++workerIndex) {
+        CHK_RET(CheckHcommRet(HcommThreadNotifyWaitOnThread(resource.threads[workerIndex],
+            launchNotifyIndex, CUSTOM_TIMEOUT), "HcommThreadNotifyWaitOnThread"));
+    }
+    return HCCL_SUCCESS;
+}
+
 HcclResult WaitAllWorkers(const AlgResourceCtx &resource)
 {
     // 主线程必须等所有 worker 的最后一条任务完成，才能通知 Host 本次 Kernel
@@ -433,6 +495,7 @@ HcclResult WaitAllWorkers(const AlgResourceCtx &resource)
 HcclResult ExecuteDistributedRoot(const OpParam &param, const AlgResourceCtx &resource,
     const ExecutionPlan &plan)
 {
+    CHK_RET(StartAllWorkers(resource));
     // 第一阶段：root Scatter。
     // 每个 root worker 只负责一个 owner：从用户 buf 取出该 owner 的 block-cyclic
     // Tile，写入 owner rank 对应的远端槽位。所有 owner worker 可并行执行。
@@ -490,15 +553,8 @@ HcclResult SubmitPeerExchange(const OpParam &param, const AlgResourceCtx &resour
     const TileDesc &ownTile, const TileDesc &peerTile)
 {
     if (ownTile.valid && peerTile.valid) {
-        // 两个 owner 可能同时互发。统一规定较小 rank 先 Send、较大 rank 先
-        // Receive，使一对 rank 的首个操作必然互补，避免双方都先 Wait。
-        if (param.myRank < channel.remoteRank) {
-            CHK_RET(SubmitSendTile(worker, channel, resource, plan, ownTile));
-            CHK_RET(SubmitReceiveTile(worker, channel, param, resource, plan, peerTile));
-        } else {
-            CHK_RET(SubmitReceiveTile(worker, channel, param, resource, plan, peerTile));
-            CHK_RET(SubmitSendTile(worker, channel, resource, plan, ownTile));
-        }
+        CHK_RET(SubmitBidirectionalPeerExchange(param, resource, plan, worker, channel,
+            ownTile, peerTile));
     } else if (ownTile.valid) {
         // 最后一个 stripe 可能只有一侧有 Tile，只提交真实存在的一半协议。
         CHK_RET(SubmitSendTile(worker, channel, resource, plan, ownTile));
@@ -587,6 +643,7 @@ HcclResult ExecuteDistributedOwner(const OpParam &param, const AlgResourceCtx &r
     const ChannelInfo *rootChannel = FindChannelByRemoteRank(resource, param.root);
     CHK_PTR_NULL(rootChannel);
     ThreadHandle coordinator = resource.threads[rootChannel->workerIndex];
+    CHK_RET(StartAllWorkers(resource));
 
     // 第二阶段：owner Fanout。
     //
