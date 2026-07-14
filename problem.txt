@@ -1,0 +1,79 @@
+
+长三角赛区（Broadcast）- 初赛
+一、赛题描述
+实现集合通信算子Broadcast的操作接口，将通信域内root节点的数据广播到其他rank。其计算原理如下图所示。
+
+ops_pre.png
+
+评测环境为2*8卡昇腾Ascend 950的仿真环境，拓扑如下所示，横向为Mesh互联，纵向为Clos组网。
+
+拓扑由2个Server组成，每个Server内包含8个NPU。
+Server内8个NPU之间为Full-Mesh互联，Server间通过Clos网络互通。
+每个NPU连接Clos网络的带宽大致是Server内单条直连链路带宽的8倍。
+pre_topo.png
+
+二、核心定义与约束
+2.1 函数原型与参数说明
+HcclResult HcclBroadcast(void *buf, uint64_t count, HcclDataType dataType, uint32_t root, HcclComm comm, aclrtStream stream)
+
+参数名	输入/输出	描述
+buf	输入/输出	数据buffer地址，对于root节点，是源数据buffer地址；对于非root节点，是数据接收buffer地址。
+count	输入	参与broadcast操作的数据个数，比如只有一个float32数据参与，则count=1。
+dataType	输入	Broadcast操作的数据类型，HcclDataType类型。
+root	输入	作为broadcast root的rank id。
+comm	输入	集合通信操作所在的通信域。
+stream	输入	本rank所使用的stream。
+接口成功返回HCCL_SUCCESS，其他失败。
+
+2.2 算子约束
+所有rank的count、dataType、root均相同。
+全局只有1个root节点，但不一定是rank 0。
+2.3 规则要求
+限定使用AICPU+TS通信引擎
+三、评分指标
+赛题将从以下三个维度进行评分：
+
+功能分：通过功能测试用例验证，通过得分，不通过得0分。
+性能分：通过性能测试用例验证，不通过得0分，通过则按照带宽用量计分，带宽最高得满分，按照排名依次递减。
+如不满足2.3中的规则要求，则不得分。
+
+数据类型覆盖float32，（输入）数据size覆盖4B、512KB、512MB、400MB+4B。
+
+3.1 用例说明
+功能用例：
+
+共8个功能用例（root rank分别为0、7，数据量分别为4B、512KB、512MB、400M+4B），每个用例15分，共120分。
+代码提交后，等待实时判分。
+性能用例：
+
+共3个功能用例（root rank为0，数据量分别为512KB、512MB、400M+4B），每个用例10分，共30分。
+每天统一出1次性能分，取第二天凌晨3点前最后1次提交的代码进行性能评分。
+需保证功能用例全部通过才能参与性能评分。
+四、参考资料
+1. 📚 前置基础学习链接
+资料名称	链接
+全量学习资料(持续更新中)	HCCL 学习资料
+HCCL—昇腾高性能集合通信库简介	昇腾高性能集合通信库简介
+深度学习的分布式训练与集合通信（一）	深度学习的分布式训练与集合通信（一）
+深度学习的分布式训练与集合通信（二）	深度学习的分布式训练与集合通信（二）
+2. 📚 代码仓资料
+资料名称	链接
+HCCL代码仓库	CANN/hccl仓、CANN/hcomm仓
+通信算子开发文档	HCCL 算子开发文档
+3. 🚀 赋能视频链接
+主题	直播回放	材料归档
+HCCL软件架构介绍	HCCL软件架构赋能视频	HCCL软件架构赋能材料
+HCCL算子开发介绍	HCCL算子开发赋能视频	HCCL算子开发赋能材料
+HCCL北极星验证工具介绍	HCCL北极星验证工具赋能视频	HCCL北极星验证工具赋能材料
+初赛
+2026/07/13-2026/07/17
+进行中
+名称	赛题介绍	要求	答题	结果
+
+Broadcast算子	基于给定拓扑，实现集合通信Broadcast算子功能，主要包括控制面的资源申请和数据面的算法逻辑实现。	1、仅可修改指定文件（建议只修改前3个）：custom.h、broadcast.cc、exec_op.cc/.h、launch_aicpu_kernel.cc/.h、aicpu_kernel.cc
+2、限定使用AICPU+TS模式	开始答题	查看结果
+决赛
+2026/07/20-2026/07/24
+未开放
+该阶段尚未开放，赛题详情将在开放后公布
+
