@@ -16,15 +16,19 @@
 #include "log.h"
 
 namespace {
-// 小包由 root 直接扇出；大包先分片到 owner，再由 owner 并行扩散。
+// 极小包由 root 串行扇出；中包由 Channel worker 并行扇出；大包先分片
+// 到 owner，再由 owner 并行扩散。
 enum class AlgorithmKind : uint32_t {
     DIRECT_FANOUT = 0,
-    DISTRIBUTED_SCATTER_FANOUT = 1,
+    PARALLEL_DIRECT_FANOUT = 1,
+    DISTRIBUTED_SCATTER_FANOUT = 2,
 };
 
 struct AlgorithmConfig {
-    // 大于 1MB 才启用 Distributed，避免小包为多线程/多 Notify 付出额外开销。
-    static constexpr uint64_t kDirectThresholdBytes = 1ULL << 20;
+    // 中包只做一次本地拷贝，再由 worker 并行写所有 peer。下限避免 4B 等
+    // 极小包支付 worker 启动开销；上限同时是 Distributed 的启用阈值。
+    static constexpr uint64_t kParallelDirectMinBytes = 64ULL << 10;
+    static constexpr uint64_t kParallelDirectMaxBytes = 1ULL << 20;
     // 这是期望值；如果 HCCL Buffer 不足，BuildExecutionPlan 会按槽位容量缩小。
     static constexpr uint64_t kPreferredTileBytes = 4ULL << 20;
     static constexpr uint64_t kMinimumTileBytes = 4ULL << 10;
@@ -41,6 +45,20 @@ struct ExecutionPlan {
     uint32_t ownerCount = 0;
     uint32_t pipelineDepth = 1;
 };
+
+const char *AlgorithmName(AlgorithmKind algorithm)
+{
+    switch (algorithm) {
+        case AlgorithmKind::DIRECT_FANOUT:
+            return "DIRECT_FANOUT";
+        case AlgorithmKind::PARALLEL_DIRECT_FANOUT:
+            return "PARALLEL_DIRECT_FANOUT";
+        case AlgorithmKind::DISTRIBUTED_SCATTER_FANOUT:
+            return "DISTRIBUTED_SCATTER_FANOUT";
+        default:
+            return "UNKNOWN";
+    }
+}
 
 // 一个连续 Tile 的纯描述。所有 rank 用同一公式计算，通信双方无需额外交换元数据。
 struct TileDesc {
@@ -137,15 +155,15 @@ uint32_t WorkerDoneNotifyIndex(const ExecutionPlan &plan, uint32_t workerIndex, 
     return plan.pipelineDepth + windowIndex * plan.ownerCount + (workerIndex - 1);
 }
 
-uint32_t WorkerLaunchNotifyIndex(const ExecutionPlan &plan)
+uint32_t WorkerLaunchNotifyIndex(uint32_t workerCount, uint32_t pipelineDepth)
 {
     // 一次性 main -> worker 启动 Notify 位于所有逐 window Notify 之后。
-    return plan.pipelineDepth * (plan.ownerCount + 1);
+    return pipelineDepth * (workerCount + 1);
 }
 
-uint64_t RequiredThreadNotifyCount(uint32_t ownerCount, uint32_t pipelineDepth)
+uint64_t RequiredThreadNotifyCount(uint32_t workerCount, uint32_t pipelineDepth)
 {
-    return static_cast<uint64_t>(pipelineDepth) * (ownerCount + 1) + 1;
+    return static_cast<uint64_t>(pipelineDepth) * (workerCount + 1) + 1;
 }
 
 // 这里同时校验调用参数和反序列化后的静态资源，防止在错误 Context 上做地址计算。
@@ -213,6 +231,32 @@ bool HasDistributedResources(const OpParam &param, const AlgResourceCtx &resourc
     return true;
 }
 
+bool HasParallelDirectResources(const OpParam &param, const AlgResourceCtx &resource, uint32_t pipelineDepth)
+{
+    // Parallel Direct 允许多个 Channel 共享 worker，因此只要求 workerIndex
+    // 落在已申请线程范围内。最终每个 worker（包括没有分到 Channel 的 worker）
+    // 都会发送一次完成通知，主线程的 Record/Wait 数量始终严格一致。
+    uint64_t requiredThreadNotify = RequiredThreadNotifyCount(resource.workerCount, pipelineDepth);
+    if (resource.workerCount == 0 || resource.threads.size() != resource.workerCount + 1 ||
+        resource.aicpuThread != resource.threads[0] || requiredThreadNotify > UINT32_MAX ||
+        resource.notifyNumPerThread < requiredThreadNotify ||
+        resource.channelNotifyNum <= NOTIFY_IDX_DATA_SIGNAL) {
+        return false;
+    }
+
+    uint32_t previousRank = INVALID_VALUE_RANKID;
+    for (const auto &channel : resource.channels) {
+        if (channel.remoteRank >= param.rankSize || channel.remoteRank == param.myRank ||
+            (previousRank != INVALID_VALUE_RANKID && channel.remoteRank <= previousRank) ||
+            channel.workerIndex == 0 || channel.workerIndex > resource.workerCount ||
+            channel.notifyNum <= NOTIFY_IDX_DATA_SIGNAL || channel.remoteCclMem.addr == nullptr) {
+            return false;
+        }
+        previousRank = channel.remoteRank;
+    }
+    return true;
+}
+
 HcclResult BuildExecutionPlan(const OpParam &param, const AlgResourceCtx &resource, ExecutionPlan &plan)
 {
     uint64_t totalBytes = 0;
@@ -238,10 +282,29 @@ HcclResult BuildExecutionPlan(const OpParam &param, const AlgResourceCtx &resour
     }
 
     plan.ownerCount = param.rankSize - 1;
-    bool distributedRequested = totalBytes > AlgorithmConfig::kDirectThresholdBytes;
+    uint32_t pipelineDepth = std::max<uint32_t>(1,
+        std::min(resource.pipelineDepth, AlgorithmConfig::kPreferredPipelineDepth));
+    bool parallelDirectRequested = totalBytes >= AlgorithmConfig::kParallelDirectMinBytes &&
+        totalBytes <= AlgorithmConfig::kParallelDirectMaxBytes;
+    if (parallelDirectRequested) {
+        if (totalBytes <= commonBufferBytes && HasParallelDirectResources(param, resource, pipelineDepth)) {
+            plan.algorithm = AlgorithmKind::PARALLEL_DIRECT_FANOUT;
+            // StartAllWorkers 必须继续使用按 pipelineDepth=2 资源布局末尾申请的
+            // 独立 launch Notify，不能退回到可能与 window Notify 重叠的索引。
+            plan.pipelineDepth = pipelineDepth;
+            plan.tileBytes = totalBytes;
+            plan.stripeCount = 1;
+            return HCCL_SUCCESS;
+        }
+
+        HCCL_WARNING("parallel direct resources unavailable, fallback to serial direct, bytes=%lu "
+                     "commonBuffer=%lu workers=%u threads=%lu channelNotify=%u threadNotify=%u",
+            totalBytes, commonBufferBytes, resource.workerCount, resource.threads.size(),
+            resource.channelNotifyNum, resource.notifyNumPerThread);
+    }
+
+    bool distributedRequested = totalBytes > AlgorithmConfig::kParallelDirectMaxBytes;
     if (distributedRequested) {
-        uint32_t pipelineDepth = std::max<uint32_t>(1,
-            std::min(resource.pipelineDepth, AlgorithmConfig::kPreferredPipelineDepth));
         // Buffer 布局是 [window][owner][tile]。Tile 大小不能超过单槽位容量。
         uint64_t slotCount = static_cast<uint64_t>(plan.ownerCount) * pipelineDepth;
         uint64_t slotCapacity = slotCount == 0 ? 0 : commonBufferBytes / slotCount;
@@ -412,8 +475,8 @@ HcclResult SubmitBidirectionalPeerExchange(const OpParam &param, const AlgResour
 
 HcclResult ExecuteDirectRoot(const OpParam &param, const AlgResourceCtx &resource, const ExecutionPlan &plan)
 {
-    // Direct 模式使用主线程和 localBuffer 的第一个槽位。每个 chunk 由 root
-    // 依次写给所有非 root rank，适合 4B/512KB，避免启动多个 worker。
+    // 串行 Direct 使用主线程和 localBuffer 的第一个槽位。它既是 4B 等
+    // 极小包的低开销路径，也是资源不足或整包放不进 Buffer 时的分块保底路径。
     ThreadHandle thread = resource.aicpuThread;
     for (uint64_t stripe = 0; stripe < plan.stripeCount; ++stripe) {
         uint64_t offset = stripe * plan.tileBytes;
@@ -491,7 +554,7 @@ HcclResult StartAllWorkers(const AlgResourceCtx &resource, const ExecutionPlan &
     //
     // 逐 stripe 的 start/done Notify 已按 window 隔离；一次性启动使用布局末尾
     // 的独立索引，避免与任何 window 信号冲突。
-    uint32_t launchNotifyIndex = WorkerLaunchNotifyIndex(plan);
+    uint32_t launchNotifyIndex = WorkerLaunchNotifyIndex(resource.workerCount, plan.pipelineDepth);
     if (launchNotifyIndex >= resource.notifyNumPerThread) {
         HCCL_ERROR("worker launch notify out of range, index=%u count=%u",
             launchNotifyIndex, resource.notifyNumPerThread);
@@ -517,6 +580,57 @@ HcclResult WaitAllWorkers(const AlgResourceCtx &resource)
             "HcommThreadNotifyWaitOnThread"));
     }
     return HCCL_SUCCESS;
+}
+
+HcclResult ExecuteParallelDirectRoot(const OpParam &param, const AlgResourceCtx &resource,
+    const ExecutionPlan &plan)
+{
+    ThreadHandle mainThread = resource.aicpuThread;
+    void *localBuffer = resource.localBuffer.addr;
+
+    // 共享源 Buffer 只由主线程写一次。StartAllWorkers 中所有 main -> worker
+    // launch Record 都排在这条 LocalCopy 之后，因此每个 worker 读取前都有
+    // 明确的同线程顺序边；worker 自身只读 localBuffer，不会覆盖共享数据。
+    CHK_RET(CheckHcommRet(HcommLocalCopyOnThread(mainThread, localBuffer,
+        param.inputPtr, plan.totalBytes), "HcommLocalCopyOnThread"));
+    CHK_RET(StartAllWorkers(resource, plan));
+
+    // 每条 Channel 使用资源规划时已经绑定的 worker。当前 16 rank 默认一条
+    // Channel 对应一个 worker；把 Host 侧 kMaxWorkerCount 调为 4/8 时，多条
+    // Channel 会按 workerIndex 分组，但不同 worker 之间仍然并行。
+    for (const auto &channel : resource.channels) {
+        ThreadHandle worker = resource.threads[channel.workerIndex];
+        CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
+            NOTIFY_IDX_ACK, CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
+        CHK_RET(CheckHcommRet(HcommWriteOnThread(worker, channel.handle,
+            channel.remoteCclMem.addr, localBuffer, plan.totalBytes), "HcommWriteOnThread"));
+        CHK_RET(CheckHcommRet(HcommChannelFenceOnThread(worker, channel.handle),
+            "HcommChannelFenceOnThread"));
+        CHK_RET(CheckHcommRet(HcommChannelNotifyRecordOnThread(worker, channel.handle,
+            NOTIFY_IDX_DATA_SIGNAL), "HcommChannelNotifyRecordOnThread"));
+        CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
+            NOTIFY_IDX_ACK, CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
+    }
+
+    // 每个已启动 worker 恰好发送一个唯一完成 Notify。即使后续把 worker 数
+    // 调大、最后有 worker 没分到 Channel，也仍会产生与 WaitAllWorkers 匹配
+    // 的完成信号，不会留下悬空 Wait。
+    for (uint32_t workerIndex = 1; workerIndex <= resource.workerCount; ++workerIndex) {
+        CHK_RET(NotifyWorkerDone(resource.threads[workerIndex], mainThread, workerIndex));
+    }
+    return WaitAllWorkers(resource);
+}
+
+HcclResult ExecuteParallelDirectFanout(const OpParam &param, const AlgResourceCtx &resource,
+    const ExecutionPlan &plan)
+{
+    if (plan.totalBytes == 0 || param.rankSize == 1) {
+        return HCCL_SUCCESS;
+    }
+    // 非 root 暂时保持原 Direct 协议：初始 ACK -> DATA_READY -> LocalCopy ->
+    // 最终 ACK。只有 root 的 15 条发送 Channel 被分散到 worker。
+    return param.myRank == param.root ? ExecuteParallelDirectRoot(param, resource, plan) :
+                                       ExecuteDirectPeer(param, resource, plan);
 }
 
 HcclResult ExecuteDistributedRoot(const OpParam &param, const AlgResourceCtx &resource,
@@ -738,15 +852,17 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
     // 猜测阈值或 Buffer 大小。
     ExecutionPlan plan;
     CHK_RET(BuildExecutionPlan(param, resCtx, plan));
-    HCCL_INFO("broadcast plan rank=%u root=%u rankSize=%u bytes=%lu algorithm=%u tile=%lu stripes=%lu "
+    HCCL_INFO("broadcast plan rank=%u root=%u rankSize=%u bytes=%lu algorithm=%s tile=%lu stripes=%lu "
               "pipeline=%u workers=%u channels=%lu localBuffer=%lu",
-        param.myRank, param.root, param.rankSize, plan.totalBytes, static_cast<uint32_t>(plan.algorithm),
+        param.myRank, param.root, param.rankSize, plan.totalBytes, AlgorithmName(plan.algorithm),
         plan.tileBytes, plan.stripeCount, plan.pipelineDepth, resCtx.workerCount, resCtx.channels.size(),
         resCtx.localBuffer.size);
 
     switch (plan.algorithm) {
         case AlgorithmKind::DIRECT_FANOUT:
             return ExecuteDirectFanout(param, resCtx, plan);
+        case AlgorithmKind::PARALLEL_DIRECT_FANOUT:
+            return ExecuteParallelDirectFanout(param, resCtx, plan);
         case AlgorithmKind::DISTRIBUTED_SCATTER_FANOUT:
             return ExecuteDistributedScatterFanout(param, resCtx, plan);
         default:
