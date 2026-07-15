@@ -27,6 +27,7 @@ typedef struct {
 enum class ResourceLayoutVersion : uint32_t {
     VERSION_1 = 1,
     VERSION_2 = 2,
+    VERSION_3 = 3,
 };
 
 // 与一个远端 rank 对应的静态 Channel 资源。
@@ -50,7 +51,7 @@ struct ChannelInfo {
 // 生命周期：Host 首次调用时申请 -> 序列化到 AICPU Engine Context -> 每次
 // Kernel 启动时反序列化。这里不能放用户 buf、count、root 等调用级数据。
 struct AlgResourceCtx {
-    uint32_t layoutVersion = static_cast<uint32_t>(ResourceLayoutVersion::VERSION_2);
+    uint32_t layoutVersion = static_cast<uint32_t>(ResourceLayoutVersion::VERSION_3);
     uint32_t rankSize = 0;
     // workerCount 不包含 threads[0] 主线程；当前 16 rank 时为 15。
     uint32_t workerCount = 0;

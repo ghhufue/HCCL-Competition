@@ -25,7 +25,7 @@
 namespace {
 // 资源 Tag 只描述静态资源布局，不包含 root/count/buf。这样不同调用可以复用
 // Thread、Channel 和 Engine Context。布局字段变化时必须同步升级 Tag 和版本号。
-constexpr char kResourceTag[] = "hccl_custom_broadcast_v2";
+constexpr char kResourceTag[] = "hccl_custom_broadcast_v3";
 
 // 双缓冲的 Channel Notify 布局：
 //   [0, 1] -> 两个窗口的 DATA_READY
@@ -73,9 +73,20 @@ ResourcePlan BuildResourcePlan(uint32_t rankSize)
         // 如果将来 rankSize 增大，超过上限的 Channel 需要改为共享 worker。
         plan.workerCount = std::min(rankSize - 1, kMaxWorkerCount);
         plan.threadNum = plan.workerCount + 1;
-        // 每个 worker 的 Notify 0 用作启动信号；主线程上的 [1, workerCount]
-        // 分别接收对应 worker 的完成信号。所有线程统一按最大数量申请。
-        plan.notifyNumPerThread = plan.workerCount + 1;
+        // Thread Notify 布局：
+        //   [0, pipelineDepth) -> coordinator 启动对应 window 的 peer worker；
+        //   [pipelineDepth, pipelineDepth + pipelineDepth * workerCount)
+        //       -> 每个 worker 在每个 window 上的完成信号；
+        //   pipelineDepth * (workerCount + 1) -> main 一次性启动全部 worker。
+        // 主线程自身仍使用 Notify 0 接收 Host 启动，并使用 [1, workerCount]
+        // 接收 worker 的最终完成信号；Notify 资源按目标 ThreadHandle 相互独立。
+        uint64_t launchNotify = static_cast<uint64_t>(plan.pipelineDepth) * (plan.workerCount + 1);
+        if (launchNotify >= UINT32_MAX) {
+            HCCL_ERROR("thread notify count overflow, workers=%u pipeline=%u",
+                plan.workerCount, plan.pipelineDepth);
+            return plan;
+        }
+        plan.notifyNumPerThread = static_cast<uint32_t>(launchNotify + 1);
     }
     return plan;
 }
@@ -240,7 +251,7 @@ HcclResult HcclBroadcast(
     } else {
         // 冷路径：首次调用时一次性申请全连接 Channel 和所有 worker。
         AlgResourceCtx resCtxHost;
-        resCtxHost.layoutVersion = static_cast<uint32_t>(ResourceLayoutVersion::VERSION_2);
+        resCtxHost.layoutVersion = static_cast<uint32_t>(ResourceLayoutVersion::VERSION_3);
         resCtxHost.rankSize = param.rankSize;
         resCtxHost.channelNotifyNum = kChannelNotifyNum;
         resCtxHost.pipelineDepth = kPipelineDepth;

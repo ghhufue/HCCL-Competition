@@ -29,8 +29,6 @@ struct AlgorithmConfig {
     static constexpr uint64_t kPreferredTileBytes = 4ULL << 20;
     static constexpr uint64_t kMinimumTileBytes = 4ULL << 10;
     static constexpr uint32_t kPreferredPipelineDepth = 2;
-    // 每个 peer worker 的 Notify 0 接收 coordinator 发出的“本 stripe 可以开始”。
-    static constexpr uint32_t kWorkerStartNotifyIndex = 0;
 };
 
 // 根据本次调用动态生成的执行计划，不会写回 Engine Context。
@@ -127,6 +125,29 @@ uint32_t SlotConsumedNotifyIndex(const ExecutionPlan &plan, uint32_t windowIndex
     return plan.pipelineDepth + windowIndex;
 }
 
+uint32_t WorkerStartNotifyIndex(uint32_t windowIndex)
+{
+    // 每个 pipeline window 使用独立的启动 Notify，避免多个 Record 合并成一个信号。
+    return windowIndex;
+}
+
+uint32_t WorkerDoneNotifyIndex(const ExecutionPlan &plan, uint32_t workerIndex, uint32_t windowIndex)
+{
+    // 每个 worker 的每个 window 都使用独立的完成 Notify。
+    return plan.pipelineDepth + windowIndex * plan.ownerCount + (workerIndex - 1);
+}
+
+uint32_t WorkerLaunchNotifyIndex(const ExecutionPlan &plan)
+{
+    // 一次性 main -> worker 启动 Notify 位于所有逐 window Notify 之后。
+    return plan.pipelineDepth * (plan.ownerCount + 1);
+}
+
+uint64_t RequiredThreadNotifyCount(uint32_t ownerCount, uint32_t pipelineDepth)
+{
+    return static_cast<uint64_t>(pipelineDepth) * (ownerCount + 1) + 1;
+}
+
 // 这里同时校验调用参数和反序列化后的静态资源，防止在错误 Context 上做地址计算。
 HcclResult ValidateExecutionContext(const OpParam &param, const AlgResourceCtx &resource, uint64_t &totalBytes)
 {
@@ -138,7 +159,7 @@ HcclResult ValidateExecutionContext(const OpParam &param, const AlgResourceCtx &
         HCCL_ERROR("invalid rank info, myRank=%u root=%u rankSize=%u", param.myRank, param.root, param.rankSize);
         return HCCL_E_PARA;
     }
-    if (resource.layoutVersion != static_cast<uint32_t>(ResourceLayoutVersion::VERSION_2)) {
+    if (resource.layoutVersion != static_cast<uint32_t>(ResourceLayoutVersion::VERSION_3)) {
         HCCL_ERROR("unsupported resource layout version=%u", resource.layoutVersion);
         return HCCL_E_PARA;
     }
@@ -169,8 +190,10 @@ bool HasDistributedResources(const OpParam &param, const AlgResourceCtx &resourc
     // Distributed 要求：每个 peer 有唯一 worker、所有 Channel 按 rank 升序、
     // Thread/Channel Notify 数足够支撑双缓冲。条件不满足时安全回退 Direct。
     uint32_t ownerCount = param.rankSize - 1;
+    uint64_t requiredThreadNotify = RequiredThreadNotifyCount(ownerCount, pipelineDepth);
     if (ownerCount == 0 || resource.workerCount != ownerCount || resource.threads.size() != ownerCount + 1 ||
-        resource.aicpuThread != resource.threads[0] || resource.notifyNumPerThread <= ownerCount ||
+        resource.aicpuThread != resource.threads[0] || requiredThreadNotify > UINT32_MAX ||
+        resource.notifyNumPerThread < requiredThreadNotify ||
         resource.channelNotifyNum < pipelineDepth * 2) {
         return false;
     }
@@ -460,16 +483,20 @@ HcclResult NotifyWorkerDone(ThreadHandle worker, ThreadHandle mainThread, uint32
         "HcommThreadNotifyRecordOnThread");
 }
 
-HcclResult StartAllWorkers(const AlgResourceCtx &resource)
+HcclResult StartAllWorkers(const AlgResourceCtx &resource, const ExecutionPlan &plan)
 {
     // Checker 和真实 TS 都从 AICPU 主线程开始推进任务。显式建立
     // main -> worker 的启动边，否则主线程首先执行 WaitAllWorkers，而 worker
     // 流只有末尾的 worker -> main 完成边，整个子图会形成不可达的闭环。
     //
-    // 每个 worker 的 Notify 0 已用于逐 stripe 启动；这里使用 workerCount
-    // 作为一次性的启动索引。资源侧为每个线程申请了 workerCount + 1 个
-    // Notify，因此该索引始终有效，且不会与主线程上的完成索引冲突。
-    uint32_t launchNotifyIndex = resource.workerCount;
+    // 逐 stripe 的 start/done Notify 已按 window 隔离；一次性启动使用布局末尾
+    // 的独立索引，避免与任何 window 信号冲突。
+    uint32_t launchNotifyIndex = WorkerLaunchNotifyIndex(plan);
+    if (launchNotifyIndex >= resource.notifyNumPerThread) {
+        HCCL_ERROR("worker launch notify out of range, index=%u count=%u",
+            launchNotifyIndex, resource.notifyNumPerThread);
+        return HCCL_E_PARA;
+    }
     for (uint32_t workerIndex = 1; workerIndex <= resource.workerCount; ++workerIndex) {
         CHK_RET(CheckHcommRet(HcommThreadNotifyRecordOnThread(resource.aicpuThread,
             resource.threads[workerIndex], launchNotifyIndex), "HcommThreadNotifyRecordOnThread"));
@@ -495,7 +522,7 @@ HcclResult WaitAllWorkers(const AlgResourceCtx &resource)
 HcclResult ExecuteDistributedRoot(const OpParam &param, const AlgResourceCtx &resource,
     const ExecutionPlan &plan)
 {
-    CHK_RET(StartAllWorkers(resource));
+    CHK_RET(StartAllWorkers(resource, plan));
     // 第一阶段：root Scatter。
     // 每个 root worker 只负责一个 owner：从用户 buf 取出该 owner 的 block-cyclic
     // Tile，写入 owner rank 对应的远端槽位。所有 owner worker 可并行执行。
@@ -583,7 +610,7 @@ HcclResult SubmitOwnerStripeStart(const OpParam &param, const AlgResourceCtx &re
             continue;
         }
         CHK_RET(CheckHcommRet(HcommThreadNotifyRecordOnThread(coordinator,
-            resource.threads[channel.workerIndex], AlgorithmConfig::kWorkerStartNotifyIndex),
+            resource.threads[channel.workerIndex], WorkerStartNotifyIndex(ownTile.windowIndex)),
             "HcommThreadNotifyRecordOnThread"));
     }
     return HCCL_SUCCESS;
@@ -594,6 +621,7 @@ HcclResult SubmitOwnerStripeFinish(const OpParam &param, const AlgResourceCtx &r
     uint64_t stripe)
 {
     ThreadHandle coordinator = resource.threads[rootChannel.workerIndex];
+    TileDesc ownTile = MakeTileDesc(param, plan, stripe, ownOwnerIndex);
     // 等 14 个 peer worker 都结束本 stripe，意味着：
     //   - ownTile 已经 fanout 给所有其他非 root rank；
     //   - 从其他 owner 接收的 Tile 也已复制到本 rank 用户 Buffer。
@@ -602,9 +630,9 @@ HcclResult SubmitOwnerStripeFinish(const OpParam &param, const AlgResourceCtx &r
             continue;
         }
         CHK_RET(CheckHcommRet(HcommThreadNotifyWaitOnThread(coordinator,
-            channel.workerIndex, CUSTOM_TIMEOUT), "HcommThreadNotifyWaitOnThread"));
+            WorkerDoneNotifyIndex(plan, channel.workerIndex, ownTile.windowIndex), CUSTOM_TIMEOUT),
+            "HcommThreadNotifyWaitOnThread"));
     }
-    TileDesc ownTile = MakeTileDesc(param, plan, stripe, ownOwnerIndex);
     if (ownTile.valid) {
         // 到这里已没有 worker 继续读取 ownTile 槽位，可以安全允许 root 覆盖它。
         CHK_RET(CheckHcommRet(HcommChannelNotifyRecordOnThread(coordinator, rootChannel.handle,
@@ -622,15 +650,16 @@ HcclResult SubmitPeerWorkerStripe(const OpParam &param, const AlgResourceCtx &re
         return HCCL_E_INTERNAL;
     }
     ThreadHandle worker = resource.threads[channel.workerIndex];
+    TileDesc ownTile = MakeTileDesc(param, plan, stripe, ownOwnerIndex);
+    TileDesc peerTile = MakeTileDesc(param, plan, stripe, peerOwnerIndex);
     // 每条 peer Channel 独占一个 worker。先等 coordinator 确认自己的 owner Tile
     // 已就绪，再与该 peer 同时完成“发送 ownTile + 接收 peerTile”。
     CHK_RET(CheckHcommRet(HcommThreadNotifyWaitOnThread(worker,
-        AlgorithmConfig::kWorkerStartNotifyIndex, CUSTOM_TIMEOUT), "HcommThreadNotifyWaitOnThread"));
-    TileDesc ownTile = MakeTileDesc(param, plan, stripe, ownOwnerIndex);
-    TileDesc peerTile = MakeTileDesc(param, plan, stripe, peerOwnerIndex);
+        WorkerStartNotifyIndex(ownTile.windowIndex), CUSTOM_TIMEOUT), "HcommThreadNotifyWaitOnThread"));
     CHK_RET(SubmitPeerExchange(param, resource, plan, worker, channel, ownTile, peerTile));
     return CheckHcommRet(HcommThreadNotifyRecordOnThread(worker, coordinator,
-        channel.workerIndex), "HcommThreadNotifyRecordOnThread");
+        WorkerDoneNotifyIndex(plan, channel.workerIndex, ownTile.windowIndex)),
+        "HcommThreadNotifyRecordOnThread");
 }
 
 HcclResult ExecuteDistributedOwner(const OpParam &param, const AlgResourceCtx &resource,
@@ -643,7 +672,7 @@ HcclResult ExecuteDistributedOwner(const OpParam &param, const AlgResourceCtx &r
     const ChannelInfo *rootChannel = FindChannelByRemoteRank(resource, param.root);
     CHK_PTR_NULL(rootChannel);
     ThreadHandle coordinator = resource.threads[rootChannel->workerIndex];
-    CHK_RET(StartAllWorkers(resource));
+    CHK_RET(StartAllWorkers(resource, plan));
 
     // 第二阶段：owner Fanout。
     //
