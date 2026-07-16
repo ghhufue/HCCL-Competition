@@ -22,7 +22,16 @@ enum class AlgorithmKind : uint32_t {
     DIRECT_FANOUT = 0,
     PARALLEL_DIRECT_FANOUT = 1,
     DISTRIBUTED_SCATTER_FANOUT = 2,
+    ONE_SHOT_SCATTER_ALLGATHER_512K = 3,
 };
+
+constexpr uint64_t kOneShot512KBytes = 512ULL << 10;
+constexpr uint32_t kOneShot512KRankSize = 16;
+constexpr uint32_t kOneShot512KOwnerCount = kOneShot512KRankSize - 1;
+constexpr uint32_t kOneShotStaticPipelineDepth = 2;
+constexpr uint32_t kOneShotDataReadyNotifyIndex = 0;
+constexpr uint32_t kOneShotFinalAckNotifyIndex = 2;
+constexpr uint32_t kOneShotPeerStartNotifyIndex = 0;
 
 struct AlgorithmConfig {
     // 中包只做一次本地拷贝，再由 worker 并行写所有 peer。下限避免 4B 等
@@ -30,7 +39,7 @@ struct AlgorithmConfig {
     static constexpr uint64_t kParallelDirectMinBytes = 64ULL << 10;
     static constexpr uint64_t kParallelDirectMaxBytes = 1ULL << 20;
     // 这是期望值；如果 HCCL Buffer 不足，BuildExecutionPlan 会按槽位容量缩小。
-    static constexpr uint64_t kPreferredTileBytes = 4ULL << 20;
+    static constexpr uint64_t kPreferredTileBytes = 12ULL << 20;
     static constexpr uint64_t kMinimumTileBytes = 4ULL << 10;
     static constexpr uint32_t kPreferredPipelineDepth = 2;
 };
@@ -55,10 +64,20 @@ const char *AlgorithmName(AlgorithmKind algorithm)
             return "PARALLEL_DIRECT_FANOUT";
         case AlgorithmKind::DISTRIBUTED_SCATTER_FANOUT:
             return "DISTRIBUTED_SCATTER_FANOUT";
+        case AlgorithmKind::ONE_SHOT_SCATTER_ALLGATHER_512K:
+            return "ONE_SHOT_SCATTER_ALLGATHER_512K";
         default:
             return "UNKNOWN";
     }
 }
+
+struct OneShotSliceDesc {
+    uint32_t ownerIndex = 0;
+    uint32_t ownerRank = INVALID_VALUE_RANKID;
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+    bool valid = false;
+};
 
 // 一个连续 Tile 的纯描述。所有 rank 用同一公式计算，通信双方无需额外交换元数据。
 struct TileDesc {
@@ -93,6 +112,22 @@ uint64_t DivideRoundUp(uint64_t value, uint64_t divisor)
 uint64_t AlignDown(uint64_t value, uint64_t alignment)
 {
     return alignment == 0 ? value : value - value % alignment;
+}
+
+bool CalculateOneShotSliceBytes(uint64_t totalBytes, uint32_t ownerCount, uint64_t elementSize,
+    uint64_t &sliceBytes)
+{
+    if (ownerCount == 0 || elementSize == 0) {
+        return false;
+    }
+    uint64_t rawSliceBytes = DivideRoundUp(totalBytes, ownerCount);
+    uint64_t remainder = rawSliceBytes % elementSize;
+    uint64_t padding = remainder == 0 ? 0 : elementSize - remainder;
+    if (rawSliceBytes > UINT64_MAX - padding) {
+        return false;
+    }
+    sliceBytes = rawSliceBytes + padding;
+    return sliceBytes != 0;
 }
 
 uint32_t OwnerIndexToRank(uint32_t ownerIndex, uint32_t root)
@@ -257,6 +292,44 @@ bool HasParallelDirectResources(const OpParam &param, const AlgResourceCtx &reso
     return true;
 }
 
+bool HasOneShot512KResources(const OpParam &param, const AlgResourceCtx &resource, uint64_t totalBytes)
+{
+    if (totalBytes != kOneShot512KBytes || param.rankSize != kOneShot512KRankSize ||
+        resource.rankSize != param.rankSize || resource.workerCount != kOneShot512KOwnerCount ||
+        resource.channels.size() != kOneShot512KOwnerCount ||
+        resource.threads.size() != kOneShot512KOwnerCount + 1 || resource.threads.empty() ||
+        resource.aicpuThread != resource.threads[0] || resource.localBuffer.addr == nullptr ||
+        resource.localBuffer.size < totalBytes || resource.pipelineDepth != kOneShotStaticPipelineDepth ||
+        resource.channelNotifyNum <= kOneShotFinalAckNotifyIndex) {
+        return false;
+    }
+
+    uint64_t launchNotifyIndex = static_cast<uint64_t>(resource.pipelineDepth) * (resource.workerCount + 1);
+    if (launchNotifyIndex > UINT32_MAX || resource.notifyNumPerThread <= launchNotifyIndex ||
+        resource.notifyNumPerThread <= resource.workerCount) {
+        return false;
+    }
+
+    std::vector<bool> workerSeen(resource.workerCount + 1, false);
+    std::vector<bool> rankSeen(param.rankSize, false);
+    rankSeen[param.myRank] = true;
+    uint32_t previousRank = INVALID_VALUE_RANKID;
+    for (const auto &channel : resource.channels) {
+        if (channel.remoteRank >= param.rankSize || channel.remoteRank == param.myRank ||
+            (previousRank != INVALID_VALUE_RANKID && channel.remoteRank <= previousRank) ||
+            rankSeen[channel.remoteRank] || channel.workerIndex == 0 ||
+            channel.workerIndex > resource.workerCount || workerSeen[channel.workerIndex] ||
+            channel.notifyNum <= kOneShotFinalAckNotifyIndex || channel.remoteCclMem.addr == nullptr ||
+            channel.remoteCclMem.size < totalBytes) {
+            return false;
+        }
+        previousRank = channel.remoteRank;
+        rankSeen[channel.remoteRank] = true;
+        workerSeen[channel.workerIndex] = true;
+    }
+    return true;
+}
+
 HcclResult BuildExecutionPlan(const OpParam &param, const AlgResourceCtx &resource, ExecutionPlan &plan)
 {
     uint64_t totalBytes = 0;
@@ -284,6 +357,25 @@ HcclResult BuildExecutionPlan(const OpParam &param, const AlgResourceCtx &resour
     plan.ownerCount = param.rankSize - 1;
     uint32_t pipelineDepth = std::max<uint32_t>(1,
         std::min(resource.pipelineDepth, AlgorithmConfig::kPreferredPipelineDepth));
+    bool oneShotRequested = totalBytes == kOneShot512KBytes && param.rankSize == kOneShot512KRankSize;
+    if (oneShotRequested) {
+        uint64_t oneShotSliceBytes = 0;
+        if (HasOneShot512KResources(param, resource, totalBytes) &&
+            CalculateOneShotSliceBytes(totalBytes, plan.ownerCount, elementSize, oneShotSliceBytes)) {
+            plan.algorithm = AlgorithmKind::ONE_SHOT_SCATTER_ALLGATHER_512K;
+            plan.pipelineDepth = 1;
+            plan.tileBytes = oneShotSliceBytes;
+            plan.stripeCount = 1;
+            return HCCL_SUCCESS;
+        }
+
+        HCCL_WARNING("one-shot 512K resources unavailable, fallback to original selection, rank=%u "
+                     "bytes=%lu workers=%u threads=%lu channels=%lu channelNotify=%u threadNotify=%u "
+                     "resourcePipeline=%u localBuffer=%lu remoteMin=%lu",
+            param.myRank, totalBytes, resource.workerCount, resource.threads.size(), resource.channels.size(),
+            resource.channelNotifyNum, resource.notifyNumPerThread, resource.pipelineDepth,
+            resource.localBuffer.size, minRemoteBuffer);
+    }
     bool parallelDirectRequested = totalBytes >= AlgorithmConfig::kParallelDirectMinBytes &&
         totalBytes <= AlgorithmConfig::kParallelDirectMaxBytes;
     if (parallelDirectRequested) {
@@ -633,6 +725,246 @@ HcclResult ExecuteParallelDirectFanout(const OpParam &param, const AlgResourceCt
                                        ExecuteDirectPeer(param, resource, plan);
 }
 
+HcclResult CheckOneShotHcommRet(int32_t ret, const char *apiName, const OpParam &param,
+    const ChannelInfo &channel)
+{
+    if (ret != HCCL_SUCCESS) {
+        HCCL_ERROR("one-shot %s failed, ret=%d rank=%u peer=%u worker=%u", apiName, ret,
+            param.myRank, channel.remoteRank, channel.workerIndex);
+        return static_cast<HcclResult>(ret);
+    }
+    return HCCL_SUCCESS;
+}
+
+OneShotSliceDesc MakeOneShotSliceDesc(const OpParam &param, const ExecutionPlan &plan,
+    uint32_t ownerIndex)
+{
+    OneShotSliceDesc slice;
+    slice.ownerIndex = ownerIndex;
+    if (ownerIndex >= plan.ownerCount || plan.ownerCount == 0 || plan.tileBytes == 0) {
+        return slice;
+    }
+    slice.ownerRank = OwnerIndexToRank(ownerIndex, param.root);
+    if (ownerIndex > UINT64_MAX / plan.tileBytes) {
+        return slice;
+    }
+    slice.offset = static_cast<uint64_t>(ownerIndex) * plan.tileBytes;
+    if (slice.offset >= plan.totalBytes) {
+        return slice;
+    }
+    slice.bytes = std::min(plan.tileBytes, plan.totalBytes - slice.offset);
+    slice.valid = slice.bytes != 0;
+    return slice;
+}
+
+HcclResult GetOneShotSliceAddress(void *bufferBase, uint64_t bufferSize,
+    const OneShotSliceDesc &slice, void *&address)
+{
+    CHK_PTR_NULL(bufferBase);
+    if (!slice.valid || slice.offset > bufferSize || slice.bytes > bufferSize - slice.offset) {
+        HCCL_ERROR("one-shot slice out of range, owner=%u rank=%u offset=%lu bytes=%lu buffer=%lu",
+            slice.ownerIndex, slice.ownerRank, slice.offset, slice.bytes, bufferSize);
+        return HCCL_E_PARA;
+    }
+    address = OffsetPtr(bufferBase, slice.offset);
+    return HCCL_SUCCESS;
+}
+
+HcclResult StartOneShotWorkers(const OpParam &param, const AlgResourceCtx &resource)
+{
+    uint64_t launchNotify = static_cast<uint64_t>(resource.pipelineDepth) * (resource.workerCount + 1);
+    if (launchNotify > UINT32_MAX || launchNotify >= resource.notifyNumPerThread) {
+        HCCL_ERROR("one-shot worker launch notify out of range, rank=%u index=%lu count=%u",
+            param.myRank, launchNotify, resource.notifyNumPerThread);
+        return HCCL_E_PARA;
+    }
+    uint32_t launchNotifyIndex = static_cast<uint32_t>(launchNotify);
+    for (const auto &channel : resource.channels) {
+        CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyRecordOnThread(resource.aicpuThread,
+            resource.threads[channel.workerIndex], launchNotifyIndex),
+            "HcommThreadNotifyRecordOnThread(launch)", param, channel));
+    }
+    for (const auto &channel : resource.channels) {
+        CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyWaitOnThread(resource.threads[channel.workerIndex],
+            launchNotifyIndex, CUSTOM_TIMEOUT), "HcommThreadNotifyWaitOnThread(launch)", param, channel));
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult SubmitOneShotWriteAndSignal(ThreadHandle worker, const OpParam &param,
+    const ChannelInfo &channel, void *remoteAddress, const void *localAddress, uint64_t bytes)
+{
+    CHK_RET(CheckOneShotHcommRet(HcommWriteOnThread(worker, channel.handle, remoteAddress,
+        localAddress, bytes), "HcommWriteOnThread", param, channel));
+    CHK_RET(CheckOneShotHcommRet(HcommChannelFenceOnThread(worker, channel.handle),
+        "HcommChannelFenceOnThread", param, channel));
+    return CheckOneShotHcommRet(HcommChannelNotifyRecordOnThread(worker, channel.handle,
+        kOneShotDataReadyNotifyIndex), "HcommChannelNotifyRecordOnThread(DATA_READY)", param, channel);
+}
+
+HcclResult NotifyOneShotPeerDone(ThreadHandle worker, ThreadHandle coordinator,
+    const OpParam &param, const ChannelInfo &channel)
+{
+    return CheckOneShotHcommRet(HcommThreadNotifyRecordOnThread(worker, coordinator,
+        channel.workerIndex), "HcommThreadNotifyRecordOnThread(PEER_DONE)", param, channel);
+}
+
+HcclResult WaitOneShotPeerWorkers(ThreadHandle coordinator, const OpParam &param,
+    const AlgResourceCtx &resource)
+{
+    for (const auto &channel : resource.channels) {
+        if (channel.remoteRank == param.root) {
+            continue;
+        }
+        CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyWaitOnThread(coordinator,
+            channel.workerIndex, CUSTOM_TIMEOUT), "HcommThreadNotifyWaitOnThread(PEER_DONE)",
+            param, channel));
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult WaitOneShotRootWorkers(const OpParam &param, const AlgResourceCtx &resource)
+{
+    for (const auto &channel : resource.channels) {
+        CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyWaitOnThread(resource.aicpuThread,
+            channel.workerIndex, CUSTOM_TIMEOUT), "HcommThreadNotifyWaitOnThread(WORKER_DONE)",
+            param, channel));
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult ExecuteOneShot512KRoot(const OpParam &param, const AlgResourceCtx &resource,
+    const ExecutionPlan &plan)
+{
+    ThreadHandle mainThread = resource.aicpuThread;
+    CHK_RET(CheckHcommRet(HcommLocalCopyOnThread(mainThread, resource.localBuffer.addr,
+        param.inputPtr, plan.totalBytes), "HcommLocalCopyOnThread"));
+    CHK_RET(StartOneShotWorkers(param, resource));
+
+    for (const auto &channel : resource.channels) {
+        uint32_t ownerIndex = 0;
+        if (!RankToOwnerIndex(channel.remoteRank, param.root, ownerIndex)) {
+            HCCL_ERROR("one-shot invalid root owner mapping, rank=%u root=%u peer=%u",
+                param.myRank, param.root, channel.remoteRank);
+            return HCCL_E_INTERNAL;
+        }
+        OneShotSliceDesc slice = MakeOneShotSliceDesc(param, plan, ownerIndex);
+        if (!slice.valid || slice.ownerRank != channel.remoteRank) {
+            HCCL_ERROR("one-shot invalid slice, rank=%u root=%u peer=%u owner=%u offset=%lu bytes=%lu",
+                param.myRank, param.root, channel.remoteRank, ownerIndex, slice.offset, slice.bytes);
+            return HCCL_E_PARA;
+        }
+
+        void *localAddress = nullptr;
+        void *remoteAddress = nullptr;
+        CHK_RET(GetOneShotSliceAddress(resource.localBuffer.addr, resource.localBuffer.size,
+            slice, localAddress));
+        CHK_RET(GetOneShotSliceAddress(channel.remoteCclMem.addr, channel.remoteCclMem.size,
+            slice, remoteAddress));
+        ThreadHandle worker = resource.threads[channel.workerIndex];
+        CHK_RET(SubmitOneShotWriteAndSignal(worker, param, channel, remoteAddress,
+            localAddress, slice.bytes));
+        CHK_RET(CheckOneShotHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
+            kOneShotFinalAckNotifyIndex, CUSTOM_TIMEOUT),
+            "HcommChannelNotifyWaitOnThread(FINAL_ACK)", param, channel));
+        CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyRecordOnThread(worker, mainThread,
+            channel.workerIndex), "HcommThreadNotifyRecordOnThread(WORKER_DONE)", param, channel));
+    }
+    return WaitOneShotRootWorkers(param, resource);
+}
+
+HcclResult ExecuteOneShot512KOwner(const OpParam &param, const AlgResourceCtx &resource,
+    const ExecutionPlan &plan)
+{
+    uint32_t ownOwnerIndex = 0;
+    if (!RankToOwnerIndex(param.myRank, param.root, ownOwnerIndex)) {
+        return HCCL_E_INTERNAL;
+    }
+    OneShotSliceDesc ownSlice = MakeOneShotSliceDesc(param, plan, ownOwnerIndex);
+    if (!ownSlice.valid || ownSlice.ownerRank != param.myRank) {
+        HCCL_ERROR("one-shot invalid local slice, rank=%u root=%u owner=%u offset=%lu bytes=%lu",
+            param.myRank, param.root, ownOwnerIndex, ownSlice.offset, ownSlice.bytes);
+        return HCCL_E_PARA;
+    }
+
+    const ChannelInfo *rootChannel = FindChannelByRemoteRank(resource, param.root);
+    CHK_PTR_NULL(rootChannel);
+    ThreadHandle coordinator = resource.threads[rootChannel->workerIndex];
+    CHK_RET(StartOneShotWorkers(param, resource));
+
+    // A. coordinator waits for the root seed, then releases all peer workers.
+    CHK_RET(CheckOneShotHcommRet(HcommChannelNotifyWaitOnThread(coordinator,
+        rootChannel->handle, kOneShotDataReadyNotifyIndex, CUSTOM_TIMEOUT),
+        "HcommChannelNotifyWaitOnThread(ROOT_DATA_READY)", param, *rootChannel));
+    for (const auto &channel : resource.channels) {
+        if (channel.remoteRank == param.root) {
+            continue;
+        }
+        CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyRecordOnThread(coordinator,
+            resource.threads[channel.workerIndex], kOneShotPeerStartNotifyIndex),
+            "HcommThreadNotifyRecordOnThread(PEER_START)", param, channel));
+    }
+
+    // B. every peer worker sends this rank's slice before waiting for the peer's slice.
+    for (const auto &channel : resource.channels) {
+        if (channel.remoteRank == param.root) {
+            continue;
+        }
+        uint32_t peerOwnerIndex = 0;
+        if (!RankToOwnerIndex(channel.remoteRank, param.root, peerOwnerIndex)) {
+            return HCCL_E_INTERNAL;
+        }
+        OneShotSliceDesc peerSlice = MakeOneShotSliceDesc(param, plan, peerOwnerIndex);
+        if (!peerSlice.valid || peerSlice.ownerRank != channel.remoteRank) {
+            HCCL_ERROR("one-shot invalid peer slice, rank=%u root=%u peer=%u owner=%u offset=%lu bytes=%lu",
+                param.myRank, param.root, channel.remoteRank, peerOwnerIndex,
+                peerSlice.offset, peerSlice.bytes);
+            return HCCL_E_PARA;
+        }
+
+        void *localAddress = nullptr;
+        void *remoteAddress = nullptr;
+        CHK_RET(GetOneShotSliceAddress(resource.localBuffer.addr, resource.localBuffer.size,
+            ownSlice, localAddress));
+        CHK_RET(GetOneShotSliceAddress(channel.remoteCclMem.addr, channel.remoteCclMem.size,
+            ownSlice, remoteAddress));
+        ThreadHandle worker = resource.threads[channel.workerIndex];
+        CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyWaitOnThread(worker,
+            kOneShotPeerStartNotifyIndex, CUSTOM_TIMEOUT),
+            "HcommThreadNotifyWaitOnThread(PEER_START)", param, channel));
+        CHK_RET(SubmitOneShotWriteAndSignal(worker, param, channel, remoteAddress,
+            localAddress, ownSlice.bytes));
+        CHK_RET(CheckOneShotHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
+            kOneShotDataReadyNotifyIndex, CUSTOM_TIMEOUT),
+            "HcommChannelNotifyWaitOnThread(PEER_DATA_READY)", param, channel));
+        CHK_RET(NotifyOneShotPeerDone(worker, coordinator, param, channel));
+    }
+
+    // C. once all 14 remote writes have arrived, copy the assembled package once.
+    CHK_RET(WaitOneShotPeerWorkers(coordinator, param, resource));
+    CHK_RET(CheckOneShotHcommRet(HcommLocalCopyOnThread(coordinator, param.outputPtr,
+        resource.localBuffer.addr, plan.totalBytes), "HcommLocalCopyOnThread(FINAL_COPY)",
+        param, *rootChannel));
+    CHK_RET(CheckOneShotHcommRet(HcommChannelNotifyRecordOnThread(coordinator,
+        rootChannel->handle, kOneShotFinalAckNotifyIndex),
+        "HcommChannelNotifyRecordOnThread(FINAL_ACK)", param, *rootChannel));
+    CHK_RET(CheckOneShotHcommRet(HcommThreadNotifyRecordOnThread(coordinator,
+        resource.aicpuThread, rootChannel->workerIndex),
+        "HcommThreadNotifyRecordOnThread(COORDINATOR_DONE)", param, *rootChannel));
+
+    // D. completion of all peer workers is transitively carried by the coordinator.
+    return CheckOneShotHcommRet(HcommThreadNotifyWaitOnThread(resource.aicpuThread,
+        rootChannel->workerIndex, CUSTOM_TIMEOUT),
+        "HcommThreadNotifyWaitOnThread(COORDINATOR_DONE)", param, *rootChannel);
+}
+
+HcclResult ExecuteOneShot512KScatterAllGather(const OpParam &param,
+    const AlgResourceCtx &resource, const ExecutionPlan &plan)
+{
+    return param.myRank == param.root ? ExecuteOneShot512KRoot(param, resource, plan) :
+                                       ExecuteOneShot512KOwner(param, resource, plan);
+}
+
 HcclResult ExecuteDistributedRoot(const OpParam &param, const AlgResourceCtx &resource,
     const ExecutionPlan &plan)
 {
@@ -863,6 +1195,8 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
             return ExecuteDirectFanout(param, resCtx, plan);
         case AlgorithmKind::PARALLEL_DIRECT_FANOUT:
             return ExecuteParallelDirectFanout(param, resCtx, plan);
+        case AlgorithmKind::ONE_SHOT_SCATTER_ALLGATHER_512K:
+            return ExecuteOneShot512KScatterAllGather(param, resCtx, plan);
         case AlgorithmKind::DISTRIBUTED_SCATTER_FANOUT:
             return ExecuteDistributedScatterFanout(param, resCtx, plan);
         default:
