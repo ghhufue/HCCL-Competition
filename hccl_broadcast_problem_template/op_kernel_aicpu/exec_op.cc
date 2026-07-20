@@ -16,11 +16,11 @@
 #include "log.h"
 
 namespace {
-// 极小包由 root 串行扇出；中包由 Channel worker 并行扇出；大包先分片
+// 极小包由 root 串行扇出；中包由非 root 主线程主动从 root 拉取；大包先分片
 // 到 owner，再由 owner 并行扩散。
 enum class AlgorithmKind : uint32_t {
     DIRECT_FANOUT = 0,
-    PARALLEL_DIRECT_FANOUT = 1,
+    RECEIVER_PULL = 1,
     DISTRIBUTED_SCATTER_FANOUT = 2,
     ONE_SHOT_SCATTER_ALLGATHER_512K = 3,
 };
@@ -34,12 +34,12 @@ constexpr uint32_t kOneShotFinalAckNotifyIndex = 2;
 constexpr uint32_t kOneShotPeerStartNotifyIndex = 0;
 
 struct AlgorithmConfig {
-    // 中包只做一次本地拷贝，再由 worker 并行写所有 peer。下限避免 4B 等
-    // 极小包支付 worker 启动开销；上限同时是 Distributed 的启用阈值。
-    static constexpr uint64_t kParallelDirectMinBytes = 64ULL << 10;
-    static constexpr uint64_t kParallelDirectMaxBytes = 1ULL << 20;
-    // 这是期望值；如果 HCCL Buffer 不足，BuildExecutionPlan 会按槽位容量缩小。
-    static constexpr uint64_t kPreferredTileBytes = 12ULL << 20;
+    // 中包由 root 准备一次共享数据，再由所有非 root 的主线程主动读取。
+    // 下限避免极小包支付 Channel 握手开销；上限同时是 Distributed 的启用阈值。
+    static constexpr uint64_t kReceiverPullMinBytes = 64ULL << 10;
+    static constexpr uint64_t kReceiverPullMaxBytes = 1ULL << 20;
+    // Direct 路径和大包动态选择失败时使用 4 MiB；Distributed 会优先评估更大的候选值。
+    static constexpr uint64_t kPreferredTileBytes = 4ULL << 20;
     static constexpr uint64_t kMinimumTileBytes = 4ULL << 10;
     static constexpr uint32_t kPreferredPipelineDepth = 2;
 };
@@ -60,8 +60,8 @@ const char *AlgorithmName(AlgorithmKind algorithm)
     switch (algorithm) {
         case AlgorithmKind::DIRECT_FANOUT:
             return "DIRECT_FANOUT";
-        case AlgorithmKind::PARALLEL_DIRECT_FANOUT:
-            return "PARALLEL_DIRECT_FANOUT";
+        case AlgorithmKind::RECEIVER_PULL:
+            return "RECEIVER_PULL";
         case AlgorithmKind::DISTRIBUTED_SCATTER_FANOUT:
             return "DISTRIBUTED_SCATTER_FANOUT";
         case AlgorithmKind::ONE_SHOT_SCATTER_ALLGATHER_512K:
@@ -128,6 +128,63 @@ bool CalculateOneShotSliceBytes(uint64_t totalBytes, uint32_t ownerCount, uint64
     }
     sliceBytes = rawSliceBytes + padding;
     return sliceBytes != 0;
+}
+
+uint64_t GetMaxOwnerBytes(uint64_t totalBytes, uint64_t tileBytes, uint32_t ownerCount)
+{
+    if (totalBytes == 0 || tileBytes == 0 || ownerCount == 0) {
+        return 0;
+    }
+
+    uint64_t tileCount = DivideRoundUp(totalBytes, tileBytes);
+    uint64_t lastTileIndex = tileCount - 1;
+    uint64_t lastTileBytes = totalBytes - lastTileIndex * tileBytes;
+    uint32_t lastOwner = static_cast<uint32_t>(lastTileIndex % ownerCount);
+    uint64_t maxOwnerBytes = 0;
+    for (uint32_t owner = 0; owner < ownerCount && owner < tileCount; ++owner) {
+        uint64_t ownerTileCount = 1 + (lastTileIndex - owner) / ownerCount;
+        uint64_t ownerBytes = 0;
+        if (owner == lastOwner) {
+            ownerBytes = (ownerTileCount - 1) * tileBytes + lastTileBytes;
+        } else {
+            ownerBytes = ownerTileCount * tileBytes;
+        }
+        maxOwnerBytes = std::max(maxOwnerBytes, ownerBytes);
+    }
+    return maxOwnerBytes;
+}
+
+uint64_t SelectDistributedTileBytes(uint64_t totalBytes, uint32_t ownerCount,
+    uint64_t slotCapacity, uint64_t elementSize)
+{
+    if (totalBytes == 0 || ownerCount == 0 || slotCapacity == 0 || elementSize == 0) {
+        return 0;
+    }
+
+    // 优先减少 stripe，但要求 block-cyclic 分配后的最忙 owner 不超过平均负载约 10%。
+    // 这会让 512 MiB 选择 12 MiB（43 tiles / 3 stripes），而 400 MiB + 4B
+    // 选择 9 MiB（45 tiles / 3 个完整 stripe），无需硬编码测试点大小。
+    constexpr uint64_t candidates[] = {
+        12ULL << 20, 10ULL << 20, 9ULL << 20,
+        8ULL << 20, 7ULL << 20, 4ULL << 20,
+    };
+    uint64_t averageOwnerBytes = DivideRoundUp(totalBytes, ownerCount);
+    uint64_t tolerance = averageOwnerBytes / 10;
+    uint64_t maxBalancedOwnerBytes = averageOwnerBytes > UINT64_MAX - tolerance ?
+        UINT64_MAX : averageOwnerBytes + tolerance;
+
+    for (uint64_t rawCandidate : candidates) {
+        uint64_t candidate = AlignDown(rawCandidate, elementSize);
+        if (candidate < AlgorithmConfig::kMinimumTileBytes || candidate > slotCapacity) {
+            continue;
+        }
+        if (GetMaxOwnerBytes(totalBytes, candidate, ownerCount) <= maxBalancedOwnerBytes) {
+            return candidate;
+        }
+    }
+
+    // 小 Buffer 或特殊长度没有平衡候选时保持原 4 MiB 策略，并继续受真实槽位容量约束。
+    return AlignDown(std::min(AlgorithmConfig::kPreferredTileBytes, slotCapacity), elementSize);
 }
 
 uint32_t OwnerIndexToRank(uint32_t ownerIndex, uint32_t root)
@@ -266,15 +323,11 @@ bool HasDistributedResources(const OpParam &param, const AlgResourceCtx &resourc
     return true;
 }
 
-bool HasParallelDirectResources(const OpParam &param, const AlgResourceCtx &resource, uint32_t pipelineDepth)
+bool HasReceiverPullResources(const OpParam &param, const AlgResourceCtx &resource)
 {
-    // Parallel Direct 允许多个 Channel 共享 worker，因此只要求 workerIndex
-    // 落在已申请线程范围内。最终每个 worker（包括没有分到 Channel 的 worker）
-    // 都会发送一次完成通知，主线程的 Record/Wait 数量始终严格一致。
-    uint64_t requiredThreadNotify = RequiredThreadNotifyCount(resource.workerCount, pipelineDepth);
-    if (resource.workerCount == 0 || resource.threads.size() != resource.workerCount + 1 ||
-        resource.aicpuThread != resource.threads[0] || requiredThreadNotify > UINT32_MAX ||
-        resource.notifyNumPerThread < requiredThreadNotify ||
+    // Receiver Pull 只在各 rank 的 AICPU 主线程上编排任务，不依赖 worker。
+    // Host 仍为大包 Distributed 路径保留 worker 资源，但中包不会启动它们。
+    if (resource.threads.empty() || resource.aicpuThread != resource.threads[0] ||
         resource.channelNotifyNum <= NOTIFY_IDX_DATA_SIGNAL) {
         return false;
     }
@@ -283,7 +336,6 @@ bool HasParallelDirectResources(const OpParam &param, const AlgResourceCtx &reso
     for (const auto &channel : resource.channels) {
         if (channel.remoteRank >= param.rankSize || channel.remoteRank == param.myRank ||
             (previousRank != INVALID_VALUE_RANKID && channel.remoteRank <= previousRank) ||
-            channel.workerIndex == 0 || channel.workerIndex > resource.workerCount ||
             channel.notifyNum <= NOTIFY_IDX_DATA_SIGNAL || channel.remoteCclMem.addr == nullptr) {
             return false;
         }
@@ -376,32 +428,31 @@ HcclResult BuildExecutionPlan(const OpParam &param, const AlgResourceCtx &resour
             resource.channelNotifyNum, resource.notifyNumPerThread, resource.pipelineDepth,
             resource.localBuffer.size, minRemoteBuffer);
     }
-    bool parallelDirectRequested = totalBytes >= AlgorithmConfig::kParallelDirectMinBytes &&
-        totalBytes <= AlgorithmConfig::kParallelDirectMaxBytes;
-    if (parallelDirectRequested) {
-        if (totalBytes <= commonBufferBytes && HasParallelDirectResources(param, resource, pipelineDepth)) {
-            plan.algorithm = AlgorithmKind::PARALLEL_DIRECT_FANOUT;
-            // StartAllWorkers 必须继续使用按 pipelineDepth=2 资源布局末尾申请的
-            // 独立 launch Notify，不能退回到可能与 window Notify 重叠的索引。
-            plan.pipelineDepth = pipelineDepth;
+
+    bool receiverPullRequested = totalBytes >= AlgorithmConfig::kReceiverPullMinBytes &&
+        totalBytes <= AlgorithmConfig::kReceiverPullMaxBytes;
+    if (receiverPullRequested) {
+        if (totalBytes <= commonBufferBytes && HasReceiverPullResources(param, resource)) {
+            plan.algorithm = AlgorithmKind::RECEIVER_PULL;
+            plan.pipelineDepth = 1;
             plan.tileBytes = totalBytes;
             plan.stripeCount = 1;
             return HCCL_SUCCESS;
         }
 
-        HCCL_WARNING("parallel direct resources unavailable, fallback to serial direct, bytes=%lu "
-                     "commonBuffer=%lu workers=%u threads=%lu channelNotify=%u threadNotify=%u",
-            totalBytes, commonBufferBytes, resource.workerCount, resource.threads.size(),
-            resource.channelNotifyNum, resource.notifyNumPerThread);
+        HCCL_WARNING("receiver pull resources unavailable, fallback to serial direct, bytes=%lu "
+                     "commonBuffer=%lu threads=%lu channels=%lu channelNotify=%u",
+            totalBytes, commonBufferBytes, resource.threads.size(), resource.channels.size(),
+            resource.channelNotifyNum);
     }
 
-    bool distributedRequested = totalBytes > AlgorithmConfig::kParallelDirectMaxBytes;
+    bool distributedRequested = totalBytes > AlgorithmConfig::kReceiverPullMaxBytes;
     if (distributedRequested) {
         // Buffer 布局是 [window][owner][tile]。Tile 大小不能超过单槽位容量。
         uint64_t slotCount = static_cast<uint64_t>(plan.ownerCount) * pipelineDepth;
         uint64_t slotCapacity = slotCount == 0 ? 0 : commonBufferBytes / slotCount;
-        uint64_t distributedTileBytes = AlignDown(
-            std::min(AlgorithmConfig::kPreferredTileBytes, slotCapacity), elementSize);
+        uint64_t distributedTileBytes = SelectDistributedTileBytes(
+            totalBytes, plan.ownerCount, slotCapacity, elementSize);
 
         if (HasDistributedResources(param, resource, pipelineDepth) &&
             distributedTileBytes >= AlgorithmConfig::kMinimumTileBytes) {
@@ -674,55 +725,57 @@ HcclResult WaitAllWorkers(const AlgResourceCtx &resource)
     return HCCL_SUCCESS;
 }
 
-HcclResult ExecuteParallelDirectRoot(const OpParam &param, const AlgResourceCtx &resource,
+HcclResult ExecuteReceiverPullRoot(const OpParam &param, const AlgResourceCtx &resource,
     const ExecutionPlan &plan)
 {
-    ThreadHandle mainThread = resource.aicpuThread;
-    void *localBuffer = resource.localBuffer.addr;
-
-    // 共享源 Buffer 只由主线程写一次。StartAllWorkers 中所有 main -> worker
-    // launch Record 都排在这条 LocalCopy 之后，因此每个 worker 读取前都有
-    // 明确的同线程顺序边；worker 自身只读 localBuffer，不会覆盖共享数据。
-    CHK_RET(CheckHcommRet(HcommLocalCopyOnThread(mainThread, localBuffer,
+    ThreadHandle thread = resource.aicpuThread;
+    CHK_RET(CheckHcommRet(HcommLocalCopyOnThread(thread, resource.localBuffer.addr,
         param.inputPtr, plan.totalBytes), "HcommLocalCopyOnThread"));
-    CHK_RET(StartAllWorkers(resource, plan));
 
-    // 每条 Channel 使用资源规划时已经绑定的 worker。当前 16 rank 默认一条
-    // Channel 对应一个 worker；把 Host 侧 kMaxWorkerCount 调为 4/8 时，多条
-    // Channel 会按 workerIndex 分组，但不同 worker 之间仍然并行。
+    // 先向所有非 root 发布数据就绪，再等待任一完成信号，避免按 peer 串行化 Read。
+    // 这里沿用 HCOMM P2P Read 的既有协议：ACK 表示远端源数据可读，
+    // DATA_SIGNAL 表示接收方的 Read 已经完成。
     for (const auto &channel : resource.channels) {
-        ThreadHandle worker = resource.threads[channel.workerIndex];
-        CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
-            NOTIFY_IDX_ACK, CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
-        CHK_RET(CheckHcommRet(HcommWriteOnThread(worker, channel.handle,
-            channel.remoteCclMem.addr, localBuffer, plan.totalBytes), "HcommWriteOnThread"));
-        CHK_RET(CheckHcommRet(HcommChannelFenceOnThread(worker, channel.handle),
-            "HcommChannelFenceOnThread"));
-        CHK_RET(CheckHcommRet(HcommChannelNotifyRecordOnThread(worker, channel.handle,
-            NOTIFY_IDX_DATA_SIGNAL), "HcommChannelNotifyRecordOnThread"));
-        CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(worker, channel.handle,
-            NOTIFY_IDX_ACK, CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
+        CHK_RET(CheckHcommRet(HcommChannelNotifyRecordOnThread(thread, channel.handle,
+            NOTIFY_IDX_ACK), "HcommChannelNotifyRecordOnThread"));
     }
-
-    // 每个已启动 worker 恰好发送一个唯一完成 Notify。即使后续把 worker 数
-    // 调大、最后有 worker 没分到 Channel，也仍会产生与 WaitAllWorkers 匹配
-    // 的完成信号，不会留下悬空 Wait。
-    for (uint32_t workerIndex = 1; workerIndex <= resource.workerCount; ++workerIndex) {
-        CHK_RET(NotifyWorkerDone(resource.threads[workerIndex], mainThread, workerIndex));
+    for (const auto &channel : resource.channels) {
+        CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(thread, channel.handle,
+            NOTIFY_IDX_DATA_SIGNAL, CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
     }
-    return WaitAllWorkers(resource);
+    return HCCL_SUCCESS;
 }
 
-HcclResult ExecuteParallelDirectFanout(const OpParam &param, const AlgResourceCtx &resource,
+HcclResult ExecuteReceiverPullPeer(const OpParam &param, const AlgResourceCtx &resource,
+    const ExecutionPlan &plan)
+{
+    const ChannelInfo *rootChannel = FindChannelByRemoteRank(resource, param.root);
+    CHK_PTR_NULL(rootChannel);
+    if (rootChannel->remoteCclMem.size < plan.totalBytes) {
+        HCCL_ERROR("root HCCL buffer too small, root=%u size=%lu bytes=%lu",
+            param.root, rootChannel->remoteCclMem.size, plan.totalBytes);
+        return HCCL_E_PARA;
+    }
+
+    ThreadHandle thread = resource.aicpuThread;
+    CHK_RET(CheckHcommRet(HcommChannelNotifyWaitOnThread(thread, rootChannel->handle,
+        NOTIFY_IDX_ACK, CUSTOM_TIMEOUT), "HcommChannelNotifyWaitOnThread"));
+    CHK_RET(CheckHcommRet(HcommReadOnThread(thread, rootChannel->handle, param.outputPtr,
+        rootChannel->remoteCclMem.addr, plan.totalBytes), "HcommReadOnThread"));
+    // HCOMM 的 P2P Read 协议依赖同一 ThreadHandle 上的任务顺序：Read 完成后
+    // 才执行 DATA_SIGNAL Record，因此无需启动 worker 或增加额外 Fence。
+    return CheckHcommRet(HcommChannelNotifyRecordOnThread(thread, rootChannel->handle,
+        NOTIFY_IDX_DATA_SIGNAL), "HcommChannelNotifyRecordOnThread");
+}
+
+HcclResult ExecuteReceiverPull(const OpParam &param, const AlgResourceCtx &resource,
     const ExecutionPlan &plan)
 {
     if (plan.totalBytes == 0 || param.rankSize == 1) {
         return HCCL_SUCCESS;
     }
-    // 非 root 暂时保持原 Direct 协议：初始 ACK -> DATA_READY -> LocalCopy ->
-    // 最终 ACK。只有 root 的 15 条发送 Channel 被分散到 worker。
-    return param.myRank == param.root ? ExecuteParallelDirectRoot(param, resource, plan) :
-                                       ExecuteDirectPeer(param, resource, plan);
+    return param.myRank == param.root ? ExecuteReceiverPullRoot(param, resource, plan) :
+                                       ExecuteReceiverPullPeer(param, resource, plan);
 }
 
 HcclResult CheckOneShotHcommRet(int32_t ret, const char *apiName, const OpParam &param,
@@ -1193,8 +1246,8 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
     switch (plan.algorithm) {
         case AlgorithmKind::DIRECT_FANOUT:
             return ExecuteDirectFanout(param, resCtx, plan);
-        case AlgorithmKind::PARALLEL_DIRECT_FANOUT:
-            return ExecuteParallelDirectFanout(param, resCtx, plan);
+        case AlgorithmKind::RECEIVER_PULL:
+            return ExecuteReceiverPull(param, resCtx, plan);
         case AlgorithmKind::ONE_SHOT_SCATTER_ALLGATHER_512K:
             return ExecuteOneShot512KScatterAllGather(param, resCtx, plan);
         case AlgorithmKind::DISTRIBUTED_SCATTER_FANOUT:
