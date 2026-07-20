@@ -1,0 +1,56 @@
+长三角赛区（Broadcast）- 决赛
+一、赛题描述
+实现集合通信算子Broadcast的操作接口，将通信域内root节点的数据广播到其他rank。其计算原理如下图所示。
+
+ops_pre.png
+
+评测环境为4*8卡昇腾Ascend 950的仿真环境，拓扑如下所示，横向为Mesh互联，纵向为Clos组网。
+
+拓扑由4个Server组成，每个Server内包含8个NPU。
+Server内8个NPU之间为Full-Mesh互联，Server间通过Clos网络互通。
+每个NPU连接Clos网络的带宽大致是Server内单条直连链路带宽的8倍。
+基于完整32卡集群构建3种子拓扑：28、41、8+4。具体拓扑如下图所示。
+拓扑类型：2*8fin_topo_1.png
+
+拓扑类型：4*1fin_topo_2.png
+
+拓扑类型：8+4fin_topo_3.png
+
+二、核心定义与约束
+2.1 函数原型与参数说明
+HcclResult HcclBroadcast(void *buf, uint64_t count, HcclDataType dataType, uint32_t root, HcclComm comm, aclrtStream stream)
+
+参数名	输入/输出	描述
+buf	输入/输出	数据buffer地址，对于root节点，是源数据buffer地址；对于非root节点，是数据接收buffer地址。
+count	输入	参与broadcast操作的数据个数，比如只有一个float32数据参与，则count=1。
+dataType	输入	Broadcast操作的数据类型，HcclDataType类型。
+root	输入	作为broadcast root的rank id。
+comm	输入	集合通信操作所在的通信域。
+stream	输入	本rank所使用的stream。
+接口成功返回HCCL_SUCCESS，其他失败。
+
+2.2 算子约束
+所有rank的count、dataType、root均相同。
+全局只有1个root节点，但不一定是rank 0。
+针对一个对端仅能申请1个channel进行通信。基于赛题提供的拓扑，每两个npu之间仅有一条物理链路，因此与同一个对端只使用一条channel完成通信的收/发、同步等操作即可，使用多个channel不会带来额外的性能收益。
+2.3 规则要求
+限定使用CCU通信引擎
+三、评分指标
+赛题将从以下两个维度进行评分：
+
+功能分：通过功能测试用例验证，通过得分，不通过得0分。
+性能分：通过性能测试用例验证，不通过得0分，通过则按照带宽用量计分，带宽最高得满分，按照排名依次递减。
+如不满足2.3中的规则要求，则不得分。
+
+通信域覆盖3种不同拓扑类型，数据类型覆盖float32，（输入）数据size覆盖512KB、512MB、400MB+4B。
+
+3.1 用例说明
+功能用例：
+
+root rank分别为0、7/1；共18个功能用例（数据量分别为512KB、512MB、400M+4B），覆盖三种拓扑类型，每个用例3分。
+代码提交后，等待实时判分。
+性能用例：
+
+共9个性能用例（数据量分别为512KB、512MB、400M+4B），覆盖三种拓扑类型，每个用例4分。
+每天统一出1次性能分，取第二天凌晨3点前最后1次提交的代码进行性能评分。
+需保证功能用例全部通过才能参与性能评分。
