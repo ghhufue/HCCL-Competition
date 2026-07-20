@@ -21,7 +21,7 @@
 #include "binary_stream.h"
 #include "common.h"
 
-constexpr uint32_t RESOURCE_LAYOUT_VERSION = 5;
+constexpr uint32_t RESOURCE_LAYOUT_VERSION = 6;
 constexpr uint32_t BROADCAST_CCU_DIE_NUM = 2;
 constexpr uint32_t DIRECT_PHASE_COUNT = 3;
 constexpr uint32_t PULL_PHASE_COUNT = 7;
@@ -87,12 +87,14 @@ struct AlgResourceCtx {
     CommBuffer localBuffer{nullptr, 0};
     CcuKernelHandle directKernels[BROADCAST_CCU_DIE_NUM]{};
     CcuKernelHandle pullKernels[BROADCAST_CCU_DIE_NUM]{};
+    ThreadHandle slaveThread = 0;
+    uint32_t slaveThreadCount = 0;
 
     static constexpr uint64_t SerializedSize()
     {
         return sizeof(version) + sizeof(rankSize) + sizeof(activeDieMask) + sizeof(peerDieByRank) +
             sizeof(localBuffer) +
-            sizeof(directKernels) + sizeof(pullKernels);
+            sizeof(directKernels) + sizeof(pullKernels) + sizeof(slaveThread) + sizeof(slaveThreadCount);
     }
 
     std::vector<char> Serialize() const
@@ -109,6 +111,8 @@ struct AlgResourceCtx {
             binaryStream << directKernels[dieId];
             binaryStream << pullKernels[dieId];
         }
+        binaryStream << slaveThread;
+        binaryStream << slaveThreadCount;
         std::vector<char> result;
         binaryStream.Dump(result);
         return result;
@@ -128,6 +132,8 @@ struct AlgResourceCtx {
             binaryStream >> directKernels[dieId];
             binaryStream >> pullKernels[dieId];
         }
+        binaryStream >> slaveThread;
+        binaryStream >> slaveThreadCount;
     }
 };
 

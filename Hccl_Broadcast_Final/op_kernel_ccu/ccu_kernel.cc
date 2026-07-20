@@ -54,21 +54,21 @@ ccu::RemoteAddr RemoteSlice(BroadcastContext &ctx, uint32_t sourceRank, uint32_t
     return remote;
 }
 
-CcuResult NotifyPhase(BroadcastContext &ctx, ChannelHandle channel, bool wait)
+CcuResult NotifyPhase(ChannelHandle channel, uint32_t mask, bool wait)
 {
     if (wait) {
-        CCU_CHK_RET(ccu::NotifyWait(channel, CKE_PHASE, 1U));
+        CCU_CHK_RET(ccu::NotifyWait(channel, CKE_PHASE, mask));
     } else {
-        CCU_CHK_RET(ccu::NotifyRecord(channel, CKE_PHASE, 1U));
+        CCU_CHK_RET(ccu::NotifyRecord(channel, CKE_PHASE, mask));
     }
     return CCU_SUCCESS;
 }
 
-CcuResult NotifyRoot(BroadcastContext &ctx, bool wait)
+CcuResult NotifyRoot(BroadcastContext &ctx, uint32_t mask, bool wait)
 {
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
         CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
-            CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], wait));
+            CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], mask, wait));
         }
     }
     return CCU_SUCCESS;
@@ -97,25 +97,25 @@ CcuResult RunDirectRoot(BroadcastContext &ctx)
         CCU_CHK_RET(ccu::EventWait(ctx.event, completionMask));
     }
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], false));
+        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_DIRECT_DONE_ACK, false));
     }
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], true));
+        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_DIRECT_DONE_ACK, true));
     }
     return CCU_SUCCESS;
 }
 
 CcuResult RunDirectReceiver(BroadcastContext &ctx)
 {
-    CCU_CHK_RET(NotifyRoot(ctx, true));
-    CCU_CHK_RET(NotifyRoot(ctx, false));
+    CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_DIRECT_DONE_ACK, true));
+    CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_DIRECT_DONE_ACK, false));
     return CCU_SUCCESS;
 }
 
 CcuResult RunPullSeedRoot(BroadcastContext &ctx)
 {
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], true));
+        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_SEED_DONE, true));
     }
     return CCU_SUCCESS;
 }
@@ -123,7 +123,7 @@ CcuResult RunPullSeedRoot(BroadcastContext &ctx)
 CcuResult RunPullPhase2StartRoot(BroadcastContext &ctx)
 {
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], false));
+        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_PHASE2_START, false));
     }
     return CCU_SUCCESS;
 }
@@ -131,7 +131,7 @@ CcuResult RunPullPhase2StartRoot(BroadcastContext &ctx)
 CcuResult RunPullReadDoneRoot(BroadcastContext &ctx)
 {
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], true));
+        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_READ_DONE, true));
     }
     return CCU_SUCCESS;
 }
@@ -139,7 +139,7 @@ CcuResult RunPullReadDoneRoot(BroadcastContext &ctx)
 CcuResult RunPullGlobalDoneRoot(BroadcastContext &ctx)
 {
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], false));
+        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_GLOBAL_DONE, false));
     }
     return CCU_SUCCESS;
 }
@@ -161,7 +161,7 @@ CcuResult RunPullSeed(BroadcastContext &ctx)
                 CCU_CHK_RET(ccu::EventRecord(ctx.event, myMask));
             }
             CCU_CHK_RET(ccu::EventWait(ctx.event, myMask));
-            CCU_CHK_RET(NotifyPhase(ctx, ctx.arg->channels[i], false));
+            CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_SEED_DONE, false));
         }
     }
     return CCU_SUCCESS;
@@ -320,7 +320,7 @@ CcuResult CcuBroadcastPullScatterAllGatherKernel(CcuKernelArg arg)
             CCU_CHK_RET(RunPullPhase2StartRoot(ctx));
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, true));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_PHASE2_START, true));
         }
     }
     CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::ALLGATHER)) {
@@ -333,7 +333,7 @@ CcuResult CcuBroadcastPullScatterAllGatherKernel(CcuKernelArg arg)
             CCU_CHK_RET(RunPullReadDoneRoot(ctx));
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, false));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_READ_DONE, false));
         }
     }
     CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::GLOBAL_DONE)) {
@@ -341,7 +341,7 @@ CcuResult CcuBroadcastPullScatterAllGatherKernel(CcuKernelArg arg)
             CCU_CHK_RET(RunPullGlobalDoneRoot(ctx));
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, true));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_GLOBAL_DONE, true));
         }
     }
     return CCU_SUCCESS;

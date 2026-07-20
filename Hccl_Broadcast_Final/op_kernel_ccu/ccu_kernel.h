@@ -29,6 +29,14 @@ constexpr uint32_t CKE_PHASE = 1;
 constexpr uint32_t MASK_BUFFER_READY = 1U << BUFFER_XN_ID;
 constexpr uint32_t MASK_TOKEN_READY = 1U << TOKEN_XN_ID;
 
+enum BroadcastNotifyMask : uint32_t {
+    NOTIFY_SEED_DONE = 1U << 0,
+    NOTIFY_PHASE2_START = 1U << 1,
+    NOTIFY_READ_DONE = 1U << 2,
+    NOTIFY_GLOBAL_DONE = 1U << 3,
+    NOTIFY_DIRECT_DONE_ACK = 1U << 4,
+};
+
 struct BroadcastContext {
     const BroadcastKernelArg *arg;
     ccu::Variable buffer[MAX_RANK_SIZE];

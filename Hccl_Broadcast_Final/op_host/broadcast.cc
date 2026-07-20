@@ -32,6 +32,8 @@
 namespace {
 
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
+constexpr uint32_t THREAD_NOTIFY_NUM = 1;
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v6";
 
 HcclResult ValidateBroadcastParam(const OpParam &param)
 {
@@ -260,6 +262,20 @@ HcclResult RegisterBroadcastKernels(HcclComm comm, const OpParam &param,
     return HCCL_SUCCESS;
 }
 
+HcclResult AcquireSlaveThread(HcclComm comm, AlgResourceCtx &resCtx)
+{
+    const bool multiDie = (resCtx.activeDieMask & (resCtx.activeDieMask - 1U)) != 0;
+    if (!multiDie) {
+        return HCCL_SUCCESS;
+    }
+
+    CHK_RET(HcclThreadAcquire(comm, CommEngine::COMM_ENGINE_CCU, 1, THREAD_NOTIFY_NUM, &resCtx.slaveThread));
+    resCtx.slaveThreadCount = 1;
+    HCCL_DEBUG("[AcquireSlaveThread] activeDieMask=%u slaveThread=%llu", resCtx.activeDieMask,
+        static_cast<unsigned long long>(resCtx.slaveThread));
+    return HCCL_SUCCESS;
+}
+
 HcclResult CreateAndStoreEngineContext(HcclComm comm, const OpParam &param, const AlgResourceCtx &resCtx)
 {
     std::vector<char> seq = resCtx.Serialize();
@@ -284,7 +300,7 @@ HcclResult HcclBroadcast(
     CHK_PTR_NULL(stream);
 
     OpParam param;
-    const int tagRet = std::snprintf(param.tag, sizeof(param.tag), "%s", "hccl_custom_broadcast");
+    const int tagRet = std::snprintf(param.tag, sizeof(param.tag), "%s", RESOURCE_TAG);
     CHK_PRT_RET(tagRet <= 0 || static_cast<size_t>(tagRet) >= sizeof(param.tag),
         HCCL_ERROR("[HcclBroadcast] failed to create operation tag"), HCCL_E_INTERNAL);
     param.inputPtr = buf;
@@ -306,7 +322,8 @@ HcclResult HcclBroadcast(
         return HCCL_SUCCESS;
     }
 
-    CHK_RET(HcclThreadAcquireWithStream(comm, CommEngine::COMM_ENGINE_CCU, stream, 0, &param.cpuThread));
+    CHK_RET(HcclThreadAcquireWithStream(
+        comm, CommEngine::COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &param.cpuThread));
 
     void *ctx = nullptr;
     uint64_t ctxSize = 0;
@@ -328,6 +345,7 @@ HcclResult HcclBroadcast(
         CHK_RET(AcquireAllPeerChannels(
             comm, param, channelsByDie, remoteRanksByDie, resCtx.peerDieByRank));
         CHK_RET(RegisterBroadcastKernels(comm, param, channelsByDie, remoteRanksByDie, resCtx));
+        CHK_RET(AcquireSlaveThread(comm, resCtx));
         CHK_RET(CreateAndStoreEngineContext(comm, param, resCtx));
 
         CHK_RET(HcclEngineCtxGet(comm, param.tag, CommEngine::COMM_ENGINE_CCU, &ctx, &ctxSize));

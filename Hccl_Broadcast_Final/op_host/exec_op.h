@@ -37,6 +37,8 @@ struct ExecutionPlan {
 HcclResult BuildExecutionPlan(uint64_t totalBytes, uint32_t rankSize, ExecutionPlan &plan);
 HcclResult LaunchDirectChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
+HcclResult LaunchPhaseAcrossDies(const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr,
+    uint64_t token, const ChunkDesc &chunk, PullPhase phase);
 HcclResult LaunchPullScatterAllGatherChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
 HcclResult ExecOp(const OpParam &param, aclrtStream stream);
