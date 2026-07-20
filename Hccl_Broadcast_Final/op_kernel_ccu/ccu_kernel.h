@@ -11,15 +11,47 @@
 #ifndef OPS_HCCL_CCU_KERNEL_H
 #define OPS_HCCL_CCU_KERNEL_H
 
+#include <cstdint>
+
 #include <ccu/ccu_types.h>
+
+#include "common.h"
+#include "custom.h"
+
+namespace ccu = ::AscendC::ccu;
 
 namespace ops_hccl {
 
-// CCU Kernel 函数
-CcuResult CcuKernel(CcuKernelArg arg);
+constexpr uint32_t BUFFER_XN_ID = 1;
+constexpr uint32_t TOKEN_XN_ID = 2;
+constexpr uint32_t CKE_PRESYNC = 0;
+constexpr uint32_t CKE_PHASE = 1;
+constexpr uint32_t MASK_BUFFER_READY = 1U << BUFFER_XN_ID;
+constexpr uint32_t MASK_TOKEN_READY = 1U << TOKEN_XN_ID;
 
-// TODO: 可编写多个 CCU Kernel 函数，以最大化性能
-// CcuResult CcuKernel2(CcuKernelArg arg);
+struct BroadcastContext {
+    const BroadcastKernelArg *arg;
+    ccu::Variable buffer[MAX_RANK_SIZE];
+    ccu::Variable token[MAX_RANK_SIZE];
+    ccu::Variable root;
+    ccu::Variable chunkOffset;
+    ccu::Variable chunkBytes;
+    ccu::Variable sliceStride;
+    ccu::Variable activeSlices;
+    ccu::Variable tailBytes;
+    ccu::Variable kernelPhase;
+    ccu::Variable sliceBytes[MAX_RANK_SIZE];
+    ccu::Event event;
+};
+
+CcuResult InitBroadcastResource(BroadcastContext &ctx, const BroadcastKernelArg *arg);
+CcuResult LoadBroadcastArgs(BroadcastContext &ctx);
+CcuResult PublishBufferInfo(BroadcastContext &ctx);
+CcuResult WaitBufferInfo(BroadcastContext &ctx);
+CcuResult PreSyncBufferInfo(BroadcastContext &ctx);
+CcuResult CcuBroadcastDirectKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastPullScatterAllGatherKernel(CcuKernelArg arg);
+
 } // namespace ops_hccl
 
 #endif // OPS_HCCL_CCU_KERNEL_H

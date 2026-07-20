@@ -11,11 +11,35 @@
 #ifndef OPS_HCCL_CCU_EXEC_OP_H
 #define OPS_HCCL_CCU_EXEC_OP_H
 
+#include <cstdint>
+#include <vector>
+
 #include <hccl/hcomm_primitives.h>
+
 #include "common.h"
+#include "custom.h"
 
 namespace ops_hccl {
-// 执行算法任务编排
-HcclResult ExecOp(const OpParam &param);
+
+struct ChunkDesc {
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+    uint64_t sliceStride = 0;
+    uint64_t activeSlices = 0;
+    uint64_t tailBytes = 0;
+};
+
+struct ExecutionPlan {
+    KernelKind algorithm = KernelKind::PULL_SCATTER_ALLGATHER;
+    std::vector<ChunkDesc> chunks;
+};
+
+HcclResult BuildExecutionPlan(uint64_t totalBytes, uint32_t rankSize, ExecutionPlan &plan);
+HcclResult LaunchDirectChunk(
+    const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
+HcclResult LaunchPullScatterAllGatherChunk(
+    const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
+HcclResult ExecOp(const OpParam &param, aclrtStream stream);
+
 } // namespace ops_hccl
 #endif // OPS_HCCL_CCU_EXEC_OP_H

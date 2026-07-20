@@ -11,12 +11,20 @@
 #ifndef OPS_HCCL_CUSTOM_H
 #define OPS_HCCL_CUSTOM_H
 
+#include <cstdint>
 #include <memory>
-#include <hccl/hccl_types.h>
+#include <vector>
+
 #include <hccl/hccl_res.h>
+#include <hccl/hccl_types.h>
 
 #include "binary_stream.h"
 #include "common.h"
+
+constexpr uint32_t RESOURCE_LAYOUT_VERSION = 5;
+constexpr uint32_t BROADCAST_CCU_DIE_NUM = 2;
+constexpr uint32_t DIRECT_PHASE_COUNT = 3;
+constexpr uint32_t PULL_PHASE_COUNT = 7;
 
 typedef struct {
     void *addr;
@@ -28,13 +36,36 @@ struct CcuKernelArgBase {
     uint32_t channelCount;
 };
 
-// ccu kernel register所需信息
+struct BroadcastKernelArg : public CcuKernelArgBase {
+    uint32_t rankSize;
+    uint32_t rankId;
+    uint32_t remoteRanks[MAX_RANK_SIZE];
+};
+
+enum class KernelKind : uint32_t {
+    DIRECT = 0,
+    PULL_SCATTER_ALLGATHER = 1,
+};
+
+enum class PullPhase : uint64_t {
+    PRESYNC_PUBLISH = 0,
+    PRESYNC_WAIT = 1,
+    SEED = 2,
+    PHASE2_START = 3,
+    ALLGATHER = 4,
+    READ_DONE = 5,
+    GLOBAL_DONE = 6,
+};
+
+enum class DirectPhase : uint64_t {
+    PRESYNC_PUBLISH = 0,
+    PRESYNC_WAIT = 1,
+    DATA = 2,
+};
+
 struct CcuKernelInfo {
-    // kernel名称
     char kernelFuncName[64];
-    // kernel函数
     void *kernelFunc;
-    // KernelArg实例指针
     void *kernelArg;
 
 private:
@@ -49,32 +80,54 @@ public:
 };
 
 struct AlgResourceCtx {
-    ThreadHandle ccuThread;            ///< CCU通信引擎上的thread资源
-    CommBuffer localBuffer;            ///< 本端HCCL通信内存
-    std::vector<ThreadHandle> threads; ///< CCU通信引擎上的thread资源
-    std::vector<CcuKernelHandle> ccuKernels;
+    uint32_t version = RESOURCE_LAYOUT_VERSION;
+    uint32_t rankSize = 0;
+    uint32_t activeDieMask = 0;
+    uint32_t peerDieByRank[MAX_RANK_SIZE]{};
+    CommBuffer localBuffer{nullptr, 0};
+    CcuKernelHandle directKernels[BROADCAST_CCU_DIE_NUM]{};
+    CcuKernelHandle pullKernels[BROADCAST_CCU_DIE_NUM]{};
 
-    // 序列化
-    std::vector<char> Serialize()
+    static constexpr uint64_t SerializedSize()
+    {
+        return sizeof(version) + sizeof(rankSize) + sizeof(activeDieMask) + sizeof(peerDieByRank) +
+            sizeof(localBuffer) +
+            sizeof(directKernels) + sizeof(pullKernels);
+    }
+
+    std::vector<char> Serialize() const
     {
         BinaryStream binaryStream;
-        binaryStream << ccuThread;
+        binaryStream << version;
+        binaryStream << rankSize;
+        binaryStream << activeDieMask;
+        for (uint32_t rank = 0; rank < MAX_RANK_SIZE; ++rank) {
+            binaryStream << peerDieByRank[rank];
+        }
         binaryStream << localBuffer;
-        binaryStream << threads;
-        binaryStream << ccuKernels;
+        for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+            binaryStream << directKernels[dieId];
+            binaryStream << pullKernels[dieId];
+        }
         std::vector<char> result;
         binaryStream.Dump(result);
         return result;
     }
 
-    // 反序列化
     void DeSerialize(std::vector<char> &data)
     {
         BinaryStream binaryStream(data);
-        binaryStream >> ccuThread;
+        binaryStream >> version;
+        binaryStream >> rankSize;
+        binaryStream >> activeDieMask;
+        for (uint32_t rank = 0; rank < MAX_RANK_SIZE; ++rank) {
+            binaryStream >> peerDieByRank[rank];
+        }
         binaryStream >> localBuffer;
-        binaryStream >> threads;
-        binaryStream >> ccuKernels;
+        for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+            binaryStream >> directKernels[dieId];
+            binaryStream >> pullKernels[dieId];
+        }
     }
 };
 
