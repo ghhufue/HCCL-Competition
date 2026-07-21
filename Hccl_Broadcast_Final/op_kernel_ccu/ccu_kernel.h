@@ -30,10 +30,10 @@ constexpr uint32_t MASK_BUFFER_READY = 1U << BUFFER_XN_ID;
 constexpr uint32_t MASK_TOKEN_READY = 1U << TOKEN_XN_ID;
 
 enum BroadcastNotifyMask : uint32_t {
-    NOTIFY_SEED_DONE = 1U << 0,
-    NOTIFY_PHASE2_START = 1U << 1,
-    NOTIFY_READ_DONE = 1U << 2,
-    NOTIFY_GLOBAL_DONE = 1U << 3,
+    NOTIFY_SMALL_READ_DONE = 1U << 0,
+    NOTIFY_SMALL_GLOBAL_DONE = 1U << 1,
+    NOTIFY_OWNER_DONE = 1U << 2,
+    NOTIFY_OWNER_GLOBAL_DONE = 1U << 3,
 };
 
 struct BroadcastContext {
@@ -43,21 +43,35 @@ struct BroadcastContext {
     ccu::Variable root;
     ccu::Variable chunkOffset;
     ccu::Variable chunkBytes;
-    ccu::Variable sliceStride;
-    ccu::Variable activeSlices;
-    ccu::Variable tailBytes;
+    ccu::Variable ownerOffset;
+    ccu::Variable ownerBytes;
+    ccu::Variable tileSizeBytes;
+    ccu::Variable seedLoopParam;
+    ccu::Variable seedFullBytes;
+    ccu::Variable seedTailBytes;
+    ccu::Variable enablePushBatchMerge;
+    ccu::Variable maxPushBatchBytes;
+    ccu::Variable pushMergeFactor;
+    ccu::Variable pushFirstBytes;
+    ccu::Variable pushLoopOffset;
+    ccu::Variable pushLoopBytes;
+    ccu::Variable pushLoopParam;
+    ccu::Variable pushTailOffset;
+    ccu::Variable pushTailBytes;
+    ccu::Variable pushTailReadyTiles;
     ccu::Variable kernelPhase;
-    ccu::Variable sliceBytes[MAX_RANK_SIZE];
     ccu::Event event;
 };
 
 CcuResult InitBroadcastResource(BroadcastContext &ctx, const BroadcastKernelArg *arg);
-CcuResult LoadBroadcastArgs(BroadcastContext &ctx);
+CcuResult LoadSmallBroadcastArgs(BroadcastContext &ctx);
+CcuResult LoadOwnerWriteArgs(BroadcastContext &ctx);
 CcuResult PublishBufferInfo(BroadcastContext &ctx);
 CcuResult WaitBufferInfo(BroadcastContext &ctx);
 CcuResult PreSyncBufferInfo(BroadcastContext &ctx);
 CcuResult CcuBroadcastSmallReceiverPullKernel(CcuKernelArg arg);
-CcuResult CcuBroadcastPullScatterAllGatherKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastOwnerSeedKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastContiguousOwnerWriteKernel(CcuKernelArg arg);
 
 } // namespace ops_hccl
 

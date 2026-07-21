@@ -1,14 +1,11 @@
 /**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ */
 
 #include <cstdint>
+#include <vector>
 
 #include <hcomm/hcomm_primitives.h>
 
@@ -27,30 +24,43 @@
 namespace ops_hccl {
 namespace {
 
-void AddSliceOffset(ccu::Address &address, const ccu::Variable &sliceStride, uint32_t ownerRank)
+constexpr char SEED_READY_DIE0[] = "broadcast_owner_seed_ready_die0";
+constexpr char SEED_READY_DIE1[] = "broadcast_owner_seed_ready_die1";
+
+constexpr uint64_t SetBits(uint16_t bitCount)
 {
-    for (uint32_t i = 0; i < ownerRank; ++i) {
-        address += sliceStride;
-    }
+    return (uint64_t(1) << bitCount) - 1;
 }
 
-ccu::LocalAddr LocalSlice(BroadcastContext &ctx, uint32_t ownerRank)
+constexpr uint64_t PackParallelParam(uint64_t repeatNum, uint64_t repeatLoopIndex, uint64_t totalLoopNum)
+{
+    return ((repeatNum & SetBits(7)) << 55) |
+        ((repeatLoopIndex & SetBits(7)) << 48) |
+        ((totalLoopNum & SetBits(7)) << 41);
+}
+
+constexpr uint64_t PackOffsetParam(uint64_t gsaOffset, uint64_t eventOffset)
+{
+    return ((gsaOffset & SetBits(32)) << 21) | (eventOffset & SetBits(10));
+}
+
+ccu::LocalAddr LocalAt(BroadcastContext &ctx, const ccu::Variable &relativeOffset)
 {
     ccu::LocalAddr local;
     local.addr = ctx.buffer[ctx.arg->rankId];
-    local.addr += ctx.chunkOffset;
-    AddSliceOffset(local.addr, ctx.sliceStride, ownerRank);
+    local.addr += ctx.ownerOffset;
+    local.addr += relativeOffset;
     local.token = ctx.token[ctx.arg->rankId];
     return local;
 }
 
-ccu::RemoteAddr RemoteSlice(BroadcastContext &ctx, uint32_t sourceRank, uint32_t ownerRank)
+ccu::RemoteAddr RemoteAt(BroadcastContext &ctx, uint32_t peerRank, const ccu::Variable &relativeOffset)
 {
     ccu::RemoteAddr remote;
-    remote.addr = ctx.buffer[sourceRank];
-    remote.addr += ctx.chunkOffset;
-    AddSliceOffset(remote.addr, ctx.sliceStride, ownerRank);
-    remote.token = ctx.token[sourceRank];
+    remote.addr = ctx.buffer[peerRank];
+    remote.addr += ctx.ownerOffset;
+    remote.addr += relativeOffset;
+    remote.token = ctx.token[peerRank];
     return remote;
 }
 
@@ -74,105 +84,195 @@ CcuResult NotifyRoot(BroadcastContext &ctx, uint32_t mask, bool wait)
     return CCU_SUCCESS;
 }
 
-CcuResult RunPullSeedRoot(BroadcastContext &ctx)
+void RecordSeedReady(const BroadcastContext &ctx)
 {
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_SEED_DONE, true));
+    if ((ctx.arg->activeDieMask & 1U) != 0) {
+        (void)ccu::EventRecord(SEED_READY_DIE0, 1U);
     }
+    if ((ctx.arg->activeDieMask & 2U) != 0) {
+        (void)ccu::EventRecord(SEED_READY_DIE1, 1U);
+    }
+}
+
+void WaitOneSeedReady(const BroadcastContext &ctx)
+{
+    (void)ccu::EventWait(ctx.arg->dieId == 0 ? SEED_READY_DIE0 : SEED_READY_DIE1, 1U);
+}
+
+void WaitSeedReadyCount(BroadcastContext &ctx, ccu::Variable &readyTiles)
+{
+    CCU_IF(readyTiles == 1) {
+        WaitOneSeedReady(ctx);
+    }
+    CCU_IF(readyTiles == 2) {
+        WaitOneSeedReady(ctx);
+        WaitOneSeedReady(ctx);
+    }
+    CCU_IF(readyTiles == 3) {
+        WaitOneSeedReady(ctx);
+        WaitOneSeedReady(ctx);
+        WaitOneSeedReady(ctx);
+    }
+    CCU_IF(readyTiles == 4) {
+        WaitOneSeedReady(ctx);
+        WaitOneSeedReady(ctx);
+        WaitOneSeedReady(ctx);
+        WaitOneSeedReady(ctx);
+    }
+}
+
+CcuResult ExecuteLoop(ccu::Variable &loopParam, ccu::Func &body)
+{
+    ccu::Loop loop(loopParam, body);
+    ccu::Variable parallelConfig;
+    parallelConfig = PackParallelParam(0, 0, 1);
+    ccu::Variable offsetConfig;
+    offsetConfig = PackOffsetParam(0, 0);
+    std::vector<ccu::Loop> loops{loop};
+    ccu::LoopGroup group(parallelConfig, offsetConfig, 1, loops);
+    (void)group;
     return CCU_SUCCESS;
 }
 
-CcuResult RunPullPhase2StartRoot(BroadcastContext &ctx)
-{
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_PHASE2_START, false));
-    }
-    return CCU_SUCCESS;
-}
-
-CcuResult RunPullReadDoneRoot(BroadcastContext &ctx)
-{
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_READ_DONE, true));
-    }
-    return CCU_SUCCESS;
-}
-
-CcuResult RunPullGlobalDoneRoot(BroadcastContext &ctx)
-{
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_GLOBAL_DONE, false));
-    }
-    return CCU_SUCCESS;
-}
-
-CcuResult RunPullSeed(BroadcastContext &ctx)
-{
-    const uint32_t myRank = ctx.arg->rankId;
-    const uint16_t myMask = static_cast<uint16_t>(1U << myRank);
-    ccu::LocalAddr destination = LocalSlice(ctx, myRank);
-
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
-            ccu::RemoteAddr source = RemoteSlice(ctx, ctx.arg->remoteRanks[i], myRank);
-            CCU_IF(ctx.sliceBytes[myRank] != 0) {
-                CCU_CHK_RET(ccu::Read(ctx.arg->channels[i], destination, source,
-                    ctx.sliceBytes[myRank], ctx.event, myMask));
-            }
-            CCU_IF(ctx.sliceBytes[myRank] == 0) {
-                CCU_CHK_RET(ccu::EventRecord(ctx.event, myMask));
-            }
-            CCU_CHK_RET(ccu::EventWait(ctx.event, myMask));
-            CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_SEED_DONE, false));
-        }
-    }
-    return CCU_SUCCESS;
-}
-
-CcuResult RunPullAllGather(BroadcastContext &ctx)
+void SubmitOwnerWrites(BroadcastContext &ctx, ccu::LocalAddr &source,
+    std::vector<ccu::RemoteAddr> &destinations, ccu::Variable &bytes)
 {
     uint16_t completionMask = 0;
-    for (uint32_t channelIdx = 0; channelIdx < ctx.arg->channelCount; ++channelIdx) {
-        const uint32_t ownerRank = ctx.arg->remoteRanks[channelIdx];
-        const uint16_t ownerMask = static_cast<uint16_t>(1U << ownerRank);
-        ccu::LocalAddr destination = LocalSlice(ctx, ownerRank);
-        ccu::RemoteAddr source = RemoteSlice(ctx, ownerRank, ownerRank);
-        CCU_IF(ctx.sliceBytes[ownerRank] != 0) {
-            CCU_CHK_RET(ccu::Read(ctx.arg->channels[channelIdx], destination, source,
-                ctx.sliceBytes[ownerRank], ctx.event, ownerMask));
+    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+        const uint32_t peerRank = ctx.arg->remoteRanks[i];
+        const uint16_t peerMask = static_cast<uint16_t>(1U << peerRank);
+        CCU_IF(ctx.root == ctx.arg->rankId) {
+            (void)ccu::Write(ctx.arg->channels[i], destinations[i], source, bytes, ctx.event, peerMask);
         }
-        CCU_IF(ctx.sliceBytes[ownerRank] == 0) {
-            CCU_CHK_RET(ccu::EventRecord(ctx.event, ownerMask));
+        CCU_IF(ctx.root != ctx.arg->rankId) {
+            CCU_IF(ctx.root != peerRank) {
+                (void)ccu::Write(ctx.arg->channels[i], destinations[i], source, bytes, ctx.event, peerMask);
+            }
+            CCU_IF(ctx.root == peerRank) {
+                (void)ccu::EventRecord(ctx.event, peerMask);
+            }
         }
-        completionMask = static_cast<uint16_t>(completionMask | ownerMask);
+        completionMask = static_cast<uint16_t>(completionMask | peerMask);
     }
-
     if (completionMask != 0) {
-        CCU_CHK_RET(ccu::EventWait(ctx.event, completionMask));
+        (void)ccu::EventWait(ctx.event, completionMask);
+    }
+}
+
+CcuResult RunSeedFullTiles(BroadcastContext &ctx)
+{
+    CCU_IF(ctx.seedFullBytes != 0) {
+        ccu::Variable offset;
+        offset = 0;
+        ccu::LocalAddr destination = LocalAt(ctx, offset);
+        std::vector<ccu::RemoteAddr> sources(ctx.arg->channelCount);
+        for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+            sources[i] = RemoteAt(ctx, ctx.arg->remoteRanks[i], offset);
+        }
+        ccu::Func body([&ctx, &destination, &sources]() {
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
+                    ccu::Read(ctx.arg->channels[i], destination, sources[i],
+                        ctx.tileSizeBytes, ctx.event, 1U);
+                    ccu::EventWait(ctx.event, 1U);
+                }
+            }
+            RecordSeedReady(ctx);
+        });
+        CCU_CHK_RET(ExecuteLoop(ctx.seedLoopParam, body));
     }
     return CCU_SUCCESS;
 }
 
-CcuResult WaitRootBufferInfo(BroadcastContext &ctx)
+CcuResult RunSeedTail(BroadcastContext &ctx)
 {
-    constexpr uint32_t readyMask = MASK_BUFFER_READY | MASK_TOKEN_READY;
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
-            CCU_CHK_RET(ccu::NotifyWait(ctx.arg->channels[i], CKE_PRESYNC, readyMask));
+    CCU_IF(ctx.seedTailBytes != 0) {
+        ccu::Variable offset;
+        offset = ctx.seedFullBytes;
+        ccu::LocalAddr destination = LocalAt(ctx, offset);
+        for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+            CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
+                ccu::RemoteAddr source = RemoteAt(ctx, ctx.arg->remoteRanks[i], offset);
+                CCU_CHK_RET(ccu::Read(ctx.arg->channels[i], destination, source,
+                    ctx.seedTailBytes, ctx.event, 1U));
+                CCU_CHK_RET(ccu::EventWait(ctx.event, 1U));
+            }
         }
+        RecordSeedReady(ctx);
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult PushOne(BroadcastContext &ctx, ccu::Variable &relativeOffset,
+    ccu::Variable &bytes, ccu::Variable &readyTiles)
+{
+    WaitSeedReadyCount(ctx, readyTiles);
+    ccu::LocalAddr source = LocalAt(ctx, relativeOffset);
+    std::vector<ccu::RemoteAddr> destinations(ctx.arg->channelCount);
+    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+        destinations[i] = RemoteAt(ctx, ctx.arg->remoteRanks[i], relativeOffset);
+    }
+    SubmitOwnerWrites(ctx, source, destinations, bytes);
+    return CCU_SUCCESS;
+}
+
+CcuResult RunPushFirst(BroadcastContext &ctx)
+{
+    CCU_IF(ctx.pushFirstBytes != 0) {
+        ccu::Variable offset;
+        offset = 0;
+        ccu::Variable readyTiles;
+        readyTiles = 1;
+        CCU_CHK_RET(PushOne(ctx, offset, ctx.pushFirstBytes, readyTiles));
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult RunPushLoop(BroadcastContext &ctx)
+{
+    CCU_IF(ctx.pushLoopBytes != 0) {
+        ccu::Variable batchBytes;
+        batchBytes = ctx.enablePushBatchMerge;
+        CCU_IF(ctx.enablePushBatchMerge == 0) {
+            batchBytes = ctx.tileSizeBytes;
+        }
+        CCU_IF(ctx.enablePushBatchMerge != 0) {
+            batchBytes = ctx.maxPushBatchBytes;
+        }
+        ccu::Variable readyTiles;
+        readyTiles = 1;
+        CCU_IF(ctx.enablePushBatchMerge != 0) {
+            readyTiles = ctx.pushMergeFactor;
+        }
+
+        ccu::LocalAddr source = LocalAt(ctx, ctx.pushLoopOffset);
+        std::vector<ccu::RemoteAddr> destinations(ctx.arg->channelCount);
+        for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+            destinations[i] = RemoteAt(ctx, ctx.arg->remoteRanks[i], ctx.pushLoopOffset);
+        }
+        ccu::Func body([&ctx, &source, &destinations, &batchBytes, &readyTiles]() {
+            WaitSeedReadyCount(ctx, readyTiles);
+            SubmitOwnerWrites(ctx, source, destinations, batchBytes);
+        });
+        CCU_CHK_RET(ExecuteLoop(ctx.pushLoopParam, body));
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult RunPushTail(BroadcastContext &ctx)
+{
+    CCU_IF(ctx.pushTailBytes != 0) {
+        CCU_CHK_RET(PushOne(ctx, ctx.pushTailOffset, ctx.pushTailBytes, ctx.pushTailReadyTiles));
     }
     return CCU_SUCCESS;
 }
 
 CcuResult ReadFullChunkFromRoot(BroadcastContext &ctx)
 {
-    const uint32_t myRank = ctx.arg->rankId;
-    const uint16_t completionMask = static_cast<uint16_t>(1U << myRank);
     ccu::LocalAddr destination;
-    destination.addr = ctx.buffer[myRank];
+    destination.addr = ctx.buffer[ctx.arg->rankId];
     destination.addr += ctx.chunkOffset;
-    destination.token = ctx.token[myRank];
-
+    destination.token = ctx.token[ctx.arg->rankId];
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
         CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
             ccu::RemoteAddr source;
@@ -180,8 +280,8 @@ CcuResult ReadFullChunkFromRoot(BroadcastContext &ctx)
             source.addr += ctx.chunkOffset;
             source.token = ctx.token[ctx.arg->remoteRanks[i]];
             CCU_CHK_RET(ccu::Read(ctx.arg->channels[i], destination, source,
-                ctx.chunkBytes, ctx.event, completionMask));
-            CCU_CHK_RET(ccu::EventWait(ctx.event, completionMask));
+                ctx.chunkBytes, ctx.event, 1U));
+            CCU_CHK_RET(ccu::EventWait(ctx.event, 1U));
         }
     }
     return CCU_SUCCESS;
@@ -191,11 +291,12 @@ CcuResult ReadFullChunkFromRoot(BroadcastContext &ctx)
 
 CcuResult InitBroadcastResource(BroadcastContext &ctx, const BroadcastKernelArg *arg)
 {
-    if (arg == nullptr || arg->rankSize < 2 || arg->rankSize > MAX_RANK_SIZE || arg->rankId >= arg->rankSize ||
-        arg->channelCount > arg->rankSize - 1) {
+    if (arg == nullptr || arg->rankSize < 2 || arg->rankSize > MAX_RANK_SIZE ||
+        arg->rankId >= arg->rankSize || arg->dieId >= BROADCAST_CCU_DIE_NUM ||
+        arg->channelCount > arg->rankSize - 1 ||
+        (arg->activeDieMask & (1U << arg->dieId)) == 0) {
         return CCU_E_PARA;
     }
-
     bool seen[MAX_RANK_SIZE]{};
     for (uint32_t i = 0; i < arg->channelCount; ++i) {
         const uint32_t peerRank = arg->remoteRanks[i];
@@ -210,7 +311,7 @@ CcuResult InitBroadcastResource(BroadcastContext &ctx, const BroadcastKernelArg 
     return CCU_SUCCESS;
 }
 
-CcuResult LoadBroadcastArgs(BroadcastContext &ctx)
+CcuResult LoadSmallBroadcastArgs(BroadcastContext &ctx)
 {
     uint32_t argId = 0;
     CCU_CHK_RET(ccu::LoadArg(ctx.buffer[ctx.arg->rankId], argId++));
@@ -218,21 +319,34 @@ CcuResult LoadBroadcastArgs(BroadcastContext &ctx)
     CCU_CHK_RET(ccu::LoadArg(ctx.root, argId++));
     CCU_CHK_RET(ccu::LoadArg(ctx.chunkOffset, argId++));
     CCU_CHK_RET(ccu::LoadArg(ctx.chunkBytes, argId++));
-    CCU_CHK_RET(ccu::LoadArg(ctx.sliceStride, argId++));
-    CCU_CHK_RET(ccu::LoadArg(ctx.activeSlices, argId++));
-    CCU_CHK_RET(ccu::LoadArg(ctx.tailBytes, argId++));
+    argId += 3;
+    CCU_CHK_RET(ccu::LoadArg(ctx.kernelPhase, argId));
+    return CCU_SUCCESS;
+}
 
-    for (uint32_t ownerRank = 0; ownerRank < ctx.arg->rankSize; ++ownerRank) {
-        ctx.sliceBytes[ownerRank] = 0;
-    }
-    for (uint32_t activeCount = 1; activeCount <= ctx.arg->rankSize; ++activeCount) {
-        CCU_IF(ctx.activeSlices == activeCount) {
-            for (uint32_t ownerRank = 0; ownerRank + 1 < activeCount; ++ownerRank) {
-                ctx.sliceBytes[ownerRank] = ctx.sliceStride;
-            }
-            ctx.sliceBytes[activeCount - 1] = ctx.tailBytes;
-        }
-    }
+CcuResult LoadOwnerWriteArgs(BroadcastContext &ctx)
+{
+    uint32_t argId = 0;
+    CCU_CHK_RET(ccu::LoadArg(ctx.buffer[ctx.arg->rankId], argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.token[ctx.arg->rankId], argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.root, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.ownerOffset, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.ownerBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.tileSizeBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.seedLoopParam, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.seedFullBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.seedTailBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.enablePushBatchMerge, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.maxPushBatchBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushMergeFactor, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushFirstBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushLoopOffset, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushLoopBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushLoopParam, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushTailOffset, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushTailBytes, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.pushTailReadyTiles, argId++));
+    CCU_CHK_RET(ccu::LoadArg(ctx.kernelPhase, argId));
     return CCU_SUCCESS;
 }
 
@@ -268,81 +382,84 @@ CcuResult CcuBroadcastSmallReceiverPullKernel(CcuKernelArg arg)
     auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
     BroadcastContext ctx;
     CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
-    CCU_CHK_RET(LoadBroadcastArgs(ctx));
-    CCU_CHK_RET(ccu::LoadArg(ctx.kernelPhase, 8));
-
+    CCU_CHK_RET(LoadSmallBroadcastArgs(ctx));
     CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(SmallPullPhase::TRANSFER)) {
         CCU_IF(ctx.root == kernelArg->rankId) {
             CCU_CHK_RET(PublishBufferInfo(ctx));
-            CCU_CHK_RET(RunPullReadDoneRoot(ctx));
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_SMALL_READ_DONE, true));
+            }
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(WaitRootBufferInfo(ctx));
+            constexpr uint32_t readyMask = MASK_BUFFER_READY | MASK_TOKEN_READY;
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
+                    CCU_CHK_RET(ccu::NotifyWait(ctx.arg->channels[i], CKE_PRESYNC, readyMask));
+                }
+            }
             CCU_CHK_RET(ReadFullChunkFromRoot(ctx));
-            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_READ_DONE, false));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_SMALL_READ_DONE, false));
         }
     }
     CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(SmallPullPhase::GLOBAL_DONE)) {
         CCU_IF(ctx.root == kernelArg->rankId) {
-            CCU_CHK_RET(RunPullGlobalDoneRoot(ctx));
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_SMALL_GLOBAL_DONE, false));
+            }
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_GLOBAL_DONE, true));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_SMALL_GLOBAL_DONE, true));
         }
     }
     return CCU_SUCCESS;
 }
 
-CcuResult CcuBroadcastPullScatterAllGatherKernel(CcuKernelArg arg)
+CcuResult CcuBroadcastOwnerSeedKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
     BroadcastContext ctx;
     CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
-    CCU_CHK_RET(LoadBroadcastArgs(ctx));
-    CCU_CHK_RET(ccu::LoadArg(ctx.kernelPhase, 8));
+    CCU_CHK_RET(LoadOwnerWriteArgs(ctx));
+    CCU_CHK_RET(RunSeedFullTiles(ctx));
+    CCU_CHK_RET(RunSeedTail(ctx));
+    return CCU_SUCCESS;
+}
 
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::PRESYNC_PUBLISH)) {
+CcuResult CcuBroadcastContiguousOwnerWriteKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
+    BroadcastContext ctx;
+    CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
+    CCU_CHK_RET(LoadOwnerWriteArgs(ctx));
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::PRESYNC_PUBLISH)) {
         CCU_CHK_RET(PublishBufferInfo(ctx));
     }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::PRESYNC_WAIT)) {
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::PRESYNC_WAIT)) {
         CCU_CHK_RET(WaitBufferInfo(ctx));
     }
-
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::SEED)) {
+    CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
+        CCU_CHK_RET(RunPushFirst(ctx));
+        CCU_CHK_RET(RunPushLoop(ctx));
+        CCU_CHK_RET(RunPushTail(ctx));
+    }
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::OWNER_DONE)) {
         CCU_IF(ctx.root == kernelArg->rankId) {
-            CCU_CHK_RET(RunPullSeedRoot(ctx));
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_OWNER_DONE, true));
+            }
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(RunPullSeed(ctx));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_OWNER_DONE, false));
         }
     }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::PHASE2_START)) {
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::GLOBAL_DONE)) {
         CCU_IF(ctx.root == kernelArg->rankId) {
-            CCU_CHK_RET(RunPullPhase2StartRoot(ctx));
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_OWNER_GLOBAL_DONE, false));
+            }
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_PHASE2_START, true));
-        }
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::ALLGATHER)) {
-        CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(RunPullAllGather(ctx));
-        }
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::READ_DONE)) {
-        CCU_IF(ctx.root == kernelArg->rankId) {
-            CCU_CHK_RET(RunPullReadDoneRoot(ctx));
-        }
-        CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_READ_DONE, false));
-        }
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(PullPhase::GLOBAL_DONE)) {
-        CCU_IF(ctx.root == kernelArg->rankId) {
-            CCU_CHK_RET(RunPullGlobalDoneRoot(ctx));
-        }
-        CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_GLOBAL_DONE, true));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_OWNER_GLOBAL_DONE, true));
         }
     }
     return CCU_SUCCESS;

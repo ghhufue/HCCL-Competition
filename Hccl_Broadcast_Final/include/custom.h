@@ -11,6 +11,7 @@
 #ifndef OPS_HCCL_CUSTOM_H
 #define OPS_HCCL_CUSTOM_H
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -21,10 +22,101 @@
 #include "binary_stream.h"
 #include "common.h"
 
-constexpr uint32_t RESOURCE_LAYOUT_VERSION = 7;
+constexpr uint32_t RESOURCE_LAYOUT_VERSION = 8;
 constexpr uint32_t BROADCAST_CCU_DIE_NUM = 2;
 constexpr uint32_t SMALL_PULL_PHASE_COUNT = 2;
-constexpr uint32_t PULL_PHASE_COUNT = 7;
+constexpr uint32_t OWNER_WRITE_PHASE_COUNT = 4;
+
+namespace ops_hccl {
+
+struct OwnerBlock {
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+    uint32_t tileCount = 0;
+};
+
+struct PushBatchPlan {
+    uint64_t firstBytes = 0;
+    uint64_t loopOffset = 0;
+    uint64_t loopBytes = 0;
+    uint64_t loopBatchBytes = 0;
+    uint64_t loopCount = 0;
+    uint64_t tailOffset = 0;
+    uint64_t tailBytes = 0;
+    uint32_t tailReadyTiles = 0;
+};
+
+constexpr uint64_t DivideRoundUp(uint64_t value, uint64_t divisor)
+{
+    return divisor == 0 ? 0 : value / divisor + (value % divisor != 0 ? 1 : 0);
+}
+
+// Broadcast accepts FP32 only. Partition in FP32 elements so boundaries stay
+// legal and the first remainder ranks absorb the complete, non-divisible tail.
+constexpr OwnerBlock GetOwnerBlock(
+    uint64_t totalBytes, uint32_t rankSize, uint32_t ownerRank, uint64_t tileSizeBytes)
+{
+    constexpr uint64_t alignment = sizeof(float);
+    if (rankSize == 0 || ownerRank >= rankSize || tileSizeBytes == 0 || totalBytes % alignment != 0) {
+        return {};
+    }
+    const uint64_t totalElements = totalBytes / alignment;
+    const uint64_t baseElements = totalElements / rankSize;
+    const uint64_t remainderElements = totalElements % rankSize;
+    const uint64_t ownerElements = baseElements + (ownerRank < remainderElements ? 1 : 0);
+    const uint64_t precedingExtra = ownerRank < remainderElements ? ownerRank : remainderElements;
+    const uint64_t offsetElements = static_cast<uint64_t>(ownerRank) * baseElements + precedingExtra;
+    const uint64_t ownerBytes = ownerElements * alignment;
+    return {offsetElements * alignment, ownerBytes,
+        static_cast<uint32_t>(DivideRoundUp(ownerBytes, tileSizeBytes))};
+}
+
+constexpr uint64_t BytesUntilCurrentTileEnd(
+    uint64_t submittedBytes, uint64_t ownerBytes, uint64_t tileSizeBytes)
+{
+    if (submittedBytes >= ownerBytes || tileSizeBytes == 0) {
+        return 0;
+    }
+    const uint64_t tileRemaining = tileSizeBytes - submittedBytes % tileSizeBytes;
+    return std::min(tileRemaining, ownerBytes - submittedBytes);
+}
+
+constexpr uint64_t SelectPushBatchBytes(uint64_t availableBytes, uint64_t submittedBytes,
+    uint64_t ownerBytes, uint64_t tileSizeBytes, bool enablePushBatchMerge, uint64_t maxPushBatchBytes)
+{
+    if (availableBytes == 0 || submittedBytes >= ownerBytes) {
+        return 0;
+    }
+    if (!enablePushBatchMerge) {
+        return std::min(availableBytes,
+            BytesUntilCurrentTileEnd(submittedBytes, ownerBytes, tileSizeBytes));
+    }
+    return std::min(availableBytes, maxPushBatchBytes);
+}
+
+constexpr PushBatchPlan BuildPushBatchPlan(uint64_t ownerBytes, uint64_t tileSizeBytes,
+    bool enablePushBatchMerge, uint64_t maxPushBatchBytes)
+{
+    PushBatchPlan plan;
+    if (ownerBytes == 0 || tileSizeBytes == 0) {
+        return plan;
+    }
+    plan.firstBytes = enablePushBatchMerge ? std::min(ownerBytes, tileSizeBytes) : 0;
+    plan.loopOffset = plan.firstBytes;
+    const uint64_t remaining = ownerBytes - plan.firstBytes;
+    plan.loopBatchBytes = enablePushBatchMerge ? maxPushBatchBytes : tileSizeBytes;
+    if (plan.loopBatchBytes == 0) {
+        return {};
+    }
+    plan.loopCount = remaining / plan.loopBatchBytes;
+    plan.loopBytes = plan.loopCount * plan.loopBatchBytes;
+    plan.tailOffset = plan.loopOffset + plan.loopBytes;
+    plan.tailBytes = remaining - plan.loopBytes;
+    plan.tailReadyTiles = static_cast<uint32_t>(DivideRoundUp(plan.tailBytes, tileSizeBytes));
+    return plan;
+}
+
+} // namespace ops_hccl
 
 typedef struct {
     void *addr;
@@ -39,12 +131,14 @@ struct CcuKernelArgBase {
 struct BroadcastKernelArg : public CcuKernelArgBase {
     uint32_t rankSize;
     uint32_t rankId;
+    uint32_t dieId;
+    uint32_t activeDieMask;
     uint32_t remoteRanks[MAX_RANK_SIZE];
 };
 
 enum class KernelKind : uint32_t {
     SMALL_RECEIVER_PULL = 0,
-    PULL_SCATTER_ALLGATHER = 1,
+    CONTIGUOUS_OWNER_WRITE = 1,
 };
 
 enum class SmallPullPhase : uint64_t {
@@ -52,14 +146,11 @@ enum class SmallPullPhase : uint64_t {
     GLOBAL_DONE = 1,
 };
 
-enum class PullPhase : uint64_t {
+enum class OwnerWritePhase : uint64_t {
     PRESYNC_PUBLISH = 0,
     PRESYNC_WAIT = 1,
-    SEED = 2,
-    PHASE2_START = 3,
-    ALLGATHER = 4,
-    READ_DONE = 5,
-    GLOBAL_DONE = 6,
+    OWNER_DONE = 2,
+    GLOBAL_DONE = 3,
 };
 
 struct CcuKernelInfo {
@@ -85,15 +176,17 @@ struct AlgResourceCtx {
     uint32_t peerDieByRank[MAX_RANK_SIZE]{};
     CommBuffer localBuffer{nullptr, 0};
     CcuKernelHandle smallPullKernels[BROADCAST_CCU_DIE_NUM]{};
-    CcuKernelHandle pullKernels[BROADCAST_CCU_DIE_NUM]{};
-    ThreadHandle slaveThread = 0;
-    uint32_t slaveThreadCount = 0;
+    CcuKernelHandle ownerWriteKernels[BROADCAST_CCU_DIE_NUM]{};
+    CcuKernelHandle seedKernels[BROADCAST_CCU_DIE_NUM]{};
+    ThreadHandle pushThreads[BROADCAST_CCU_DIE_NUM]{};
+    uint32_t pushThreadCount = 0;
 
     static constexpr uint64_t SerializedSize()
     {
         return sizeof(version) + sizeof(rankSize) + sizeof(activeDieMask) + sizeof(peerDieByRank) +
             sizeof(localBuffer) +
-            sizeof(smallPullKernels) + sizeof(pullKernels) + sizeof(slaveThread) + sizeof(slaveThreadCount);
+            sizeof(smallPullKernels) + sizeof(ownerWriteKernels) + sizeof(seedKernels) +
+            sizeof(pushThreads) + sizeof(pushThreadCount);
     }
 
     std::vector<char> Serialize() const
@@ -108,10 +201,11 @@ struct AlgResourceCtx {
         binaryStream << localBuffer;
         for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
             binaryStream << smallPullKernels[dieId];
-            binaryStream << pullKernels[dieId];
+            binaryStream << ownerWriteKernels[dieId];
+            binaryStream << seedKernels[dieId];
+            binaryStream << pushThreads[dieId];
         }
-        binaryStream << slaveThread;
-        binaryStream << slaveThreadCount;
+        binaryStream << pushThreadCount;
         std::vector<char> result;
         binaryStream.Dump(result);
         return result;
@@ -129,10 +223,11 @@ struct AlgResourceCtx {
         binaryStream >> localBuffer;
         for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
             binaryStream >> smallPullKernels[dieId];
-            binaryStream >> pullKernels[dieId];
+            binaryStream >> ownerWriteKernels[dieId];
+            binaryStream >> seedKernels[dieId];
+            binaryStream >> pushThreads[dieId];
         }
-        binaryStream >> slaveThread;
-        binaryStream >> slaveThreadCount;
+        binaryStream >> pushThreadCount;
     }
 };
 

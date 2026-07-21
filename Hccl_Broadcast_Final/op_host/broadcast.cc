@@ -33,7 +33,7 @@ namespace {
 
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t THREAD_NOTIFY_NUM = 1;
-constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v7";
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v8";
 
 HcclResult ValidateBroadcastParam(const OpParam &param)
 {
@@ -191,11 +191,14 @@ HcclResult AcquireAllPeerChannels(
 }
 
 std::shared_ptr<BroadcastKernelArg> BuildKernelArg(const OpParam &param,
-    const std::vector<ChannelHandle> &channels, const std::vector<uint32_t> &remoteRanks)
+    const std::vector<ChannelHandle> &channels, const std::vector<uint32_t> &remoteRanks,
+    uint32_t dieId, uint32_t activeDieMask)
 {
     auto arg = std::make_shared<BroadcastKernelArg>();
     arg->rankSize = param.rankSize;
     arg->rankId = param.myRank;
+    arg->dieId = dieId;
+    arg->activeDieMask = activeDieMask;
     arg->channelCount = static_cast<uint32_t>(channels.size());
     for (uint32_t i = 0; i < arg->channelCount; ++i) {
         arg->channels[i] = channels[i];
@@ -230,20 +233,33 @@ HcclResult RegisterBroadcastKernels(HcclComm comm, const OpParam &param,
     CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
 
     HcclResult ret = HCCL_SUCCESS;
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if (!channelsByDie[dieId].empty()) {
+            resCtx.activeDieMask |= 1U << dieId;
+        }
+    }
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM && ret == HCCL_SUCCESS; ++dieId) {
         if (channelsByDie[dieId].empty()) {
             continue;
         }
-        resCtx.activeDieMask |= 1U << dieId;
-        auto smallPullArg = BuildKernelArg(param, channelsByDie[dieId], remoteRanksByDie[dieId]);
-        auto pullArg = BuildKernelArg(param, channelsByDie[dieId], remoteRanksByDie[dieId]);
+        auto smallPullArg = BuildKernelArg(
+            param, channelsByDie[dieId], remoteRanksByDie[dieId], dieId, resCtx.activeDieMask);
+        auto ownerWriteArg = BuildKernelArg(
+            param, channelsByDie[dieId], remoteRanksByDie[dieId], dieId, resCtx.activeDieMask);
+        auto seedArg = BuildKernelArg(
+            param, channelsByDie[dieId], remoteRanksByDie[dieId], dieId, resCtx.activeDieMask);
         ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastSmallReceiverPullKernel",
             reinterpret_cast<void *>(ops_hccl::CcuBroadcastSmallReceiverPullKernel), smallPullArg,
             resCtx.smallPullKernels[dieId]);
         if (ret == HCCL_SUCCESS) {
-            ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastPullScatterAllGatherKernel",
-                reinterpret_cast<void *>(ops_hccl::CcuBroadcastPullScatterAllGatherKernel), pullArg,
-                resCtx.pullKernels[dieId]);
+            ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastContiguousOwnerWriteKernel",
+                reinterpret_cast<void *>(ops_hccl::CcuBroadcastContiguousOwnerWriteKernel), ownerWriteArg,
+                resCtx.ownerWriteKernels[dieId]);
+        }
+        if (ret == HCCL_SUCCESS) {
+            ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastOwnerSeedKernel",
+                reinterpret_cast<void *>(ops_hccl::CcuBroadcastOwnerSeedKernel), seedArg,
+                resCtx.seedKernels[dieId]);
         }
     }
 
@@ -262,17 +278,26 @@ HcclResult RegisterBroadcastKernels(HcclComm comm, const OpParam &param,
     return HCCL_SUCCESS;
 }
 
-HcclResult AcquireSlaveThread(HcclComm comm, AlgResourceCtx &resCtx)
+HcclResult AcquirePushThreads(HcclComm comm, AlgResourceCtx &resCtx)
 {
-    const bool multiDie = (resCtx.activeDieMask & (resCtx.activeDieMask - 1U)) != 0;
-    if (!multiDie) {
-        return HCCL_SUCCESS;
+    uint32_t activeCount = 0;
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        activeCount += (resCtx.activeDieMask & (1U << dieId)) != 0 ? 1U : 0U;
     }
-
-    CHK_RET(HcclThreadAcquire(comm, CommEngine::COMM_ENGINE_CCU, 1, THREAD_NOTIFY_NUM, &resCtx.slaveThread));
-    resCtx.slaveThreadCount = 1;
-    HCCL_DEBUG("[AcquireSlaveThread] activeDieMask=%u slaveThread=%llu", resCtx.activeDieMask,
-        static_cast<unsigned long long>(resCtx.slaveThread));
+    CHK_PRT_RET(activeCount == 0 || activeCount > BROADCAST_CCU_DIE_NUM,
+        HCCL_ERROR("[AcquirePushThreads] invalid active die count=%u", activeCount), HCCL_E_INTERNAL);
+    ThreadHandle acquired[BROADCAST_CCU_DIE_NUM]{};
+    CHK_RET(HcclThreadAcquire(
+        comm, CommEngine::COMM_ENGINE_CCU, activeCount, THREAD_NOTIFY_NUM, acquired));
+    uint32_t threadIdx = 0;
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+            resCtx.pushThreads[dieId] = acquired[threadIdx++];
+        }
+    }
+    resCtx.pushThreadCount = activeCount;
+    HCCL_DEBUG("[AcquirePushThreads] activeDieMask=%u pushThreadCount=%u", resCtx.activeDieMask,
+        resCtx.pushThreadCount);
     return HCCL_SUCCESS;
 }
 
@@ -345,7 +370,7 @@ HcclResult HcclBroadcast(
         CHK_RET(AcquireAllPeerChannels(
             comm, param, channelsByDie, remoteRanksByDie, resCtx.peerDieByRank));
         CHK_RET(RegisterBroadcastKernels(comm, param, channelsByDie, remoteRanksByDie, resCtx));
-        CHK_RET(AcquireSlaveThread(comm, resCtx));
+        CHK_RET(AcquirePushThreads(comm, resCtx));
         CHK_RET(CreateAndStoreEngineContext(comm, param, resCtx));
 
         CHK_RET(HcclEngineCtxGet(comm, param.tag, CommEngine::COMM_ENGINE_CCU, &ctx, &ctxSize));

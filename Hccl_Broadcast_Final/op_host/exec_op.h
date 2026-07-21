@@ -24,22 +24,25 @@ namespace ops_hccl {
 struct ChunkDesc {
     uint64_t offset = 0;
     uint64_t bytes = 0;
-    uint64_t sliceStride = 0;
-    uint64_t activeSlices = 0;
-    uint64_t tailBytes = 0;
+    OwnerBlock owner;
+    uint64_t tileSizeBytes = 0;
+    uint64_t seedLoopParam = 0;
+    uint64_t seedFullBytes = 0;
+    uint64_t seedTailBytes = 0;
+    bool enablePushBatchMerge = false;
+    uint64_t maxPushBatchBytes = 0;
+    PushBatchPlan push;
 };
 
 struct ExecutionPlan {
-    KernelKind algorithm = KernelKind::PULL_SCATTER_ALLGATHER;
+    KernelKind algorithm = KernelKind::CONTIGUOUS_OWNER_WRITE;
     std::vector<ChunkDesc> chunks;
 };
 
-HcclResult BuildExecutionPlan(uint64_t totalBytes, uint32_t rankSize, ExecutionPlan &plan);
+HcclResult BuildExecutionPlan(uint64_t totalBytes, uint32_t rankSize, uint32_t rankId, ExecutionPlan &plan);
 HcclResult LaunchSmallReceiverPullChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
-HcclResult LaunchPhaseAcrossDies(const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr,
-    uint64_t token, const ChunkDesc &chunk, PullPhase phase);
-HcclResult LaunchPullScatterAllGatherChunk(
+HcclResult LaunchContiguousOwnerWriteChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
 HcclResult ExecOp(const OpParam &param, aclrtStream stream);
 
