@@ -31,7 +31,7 @@ constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 
 struct OwnerWriteConfig {
     uint64_t tileSizeBytes = DEFAULT_TILE_SIZE_BYTES;
-    bool enablePushBatchMerge = true;
+    bool enablePushBatchMerge = false;
     uint64_t maxPushBatchBytes = DEFAULT_MAX_PUSH_BATCH_BYTES;
 };
 
@@ -83,7 +83,7 @@ HcclResult LoadOwnerWriteConfig(OwnerWriteConfig &config)
 {
     CHK_RET(ParseSizeEnv("HCCL_BROADCAST_TILE_SIZE_BYTES", DEFAULT_TILE_SIZE_BYTES, config.tileSizeBytes));
     CHK_RET(ParseBoolEnv(
-        "HCCL_BROADCAST_ENABLE_PUSH_BATCH_MERGE", true, config.enablePushBatchMerge));
+        "HCCL_BROADCAST_ENABLE_PUSH_BATCH_MERGE", false, config.enablePushBatchMerge));
     CHK_RET(ParseSizeEnv("HCCL_BROADCAST_MAX_PUSH_BATCH_BYTES",
         DEFAULT_MAX_PUSH_BATCH_BYTES, config.maxPushBatchBytes));
     CHK_PRT_RET(config.tileSizeBytes % FP32_ALIGNMENT != 0 || config.tileSizeBytes > MAX_DATA_SIZE,

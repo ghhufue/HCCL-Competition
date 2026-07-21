@@ -85,6 +85,14 @@ bool SymmetricLinkLess(const CommLink &left, const CommLink &right)
         (firstCompare == 0 && CompareEndpointAddress(*leftSecond, *rightSecond) < 0);
 }
 
+uint32_t PreferredDieForRankPair(uint32_t rankA, uint32_t rankB)
+{
+    // The parity is symmetric at both ends of a Channel. For a full mesh it
+    // assigns every rank's sorted peer set to the two Dies with a difference
+    // of at most one, while still letting both ranks select the same link.
+    return (rankA + rankB) % BROADCAST_CCU_DIE_NUM;
+}
+
 HcclResult QueryBestCcuLinkToPeer(
     HcclComm comm, uint32_t myRank, uint32_t remoteRank, HcclChannelDesc &desc, uint32_t &localDieId)
 {
@@ -100,11 +108,16 @@ HcclResult QueryBestCcuLinkToPeer(
     };
     bool found = false;
     CommLink selected{};
+    uint32_t selectedScore = std::numeric_limits<uint32_t>::max();
+    const uint32_t preferredDie = PreferredDieForRankPair(myRank, remoteRank);
     for (const auto protocol : preferredProtocols) {
         if (protocol == CommProtocol::COMM_PROTOCOL_RESERVED) {
             continue;
         }
-        for (uint32_t layerIdx = 0; layerIdx < netLayerNum && !found; ++layerIdx) {
+        bool protocolFound = false;
+        uint32_t protocolBestScore = std::numeric_limits<uint32_t>::max();
+        CommLink protocolBest{};
+        for (uint32_t layerIdx = 0; layerIdx < netLayerNum; ++layerIdx) {
             CommLink *links = nullptr;
             uint32_t linkNum = 0;
             CHK_RET(HcclRankGraphGetLinks(comm, netLayers[layerIdx], myRank, remoteRank, &links, &linkNum));
@@ -112,18 +125,28 @@ HcclResult QueryBestCcuLinkToPeer(
                 if (links[linkIdx].linkAttr.linkProtocol != protocol) {
                     continue;
                 }
-                uint32_t candidateDieId = 0;
-                if (GetEndpointDieId(
-                        comm, myRank, links[linkIdx].srcEndpointDesc, candidateDieId) != HCCL_SUCCESS) {
+                uint32_t candidateLocalDie = 0;
+                uint32_t candidateRemoteDie = 0;
+                if (GetEndpointDieId(comm, myRank, links[linkIdx].srcEndpointDesc,
+                        candidateLocalDie) != HCCL_SUCCESS ||
+                    GetEndpointDieId(comm, remoteRank, links[linkIdx].dstEndpointDesc,
+                        candidateRemoteDie) != HCCL_SUCCESS) {
                     continue;
                 }
-                if (!found || SymmetricLinkLess(links[linkIdx], selected)) {
-                    selected = links[linkIdx];
+                const uint32_t score = (candidateLocalDie == preferredDie ? 0U : 1U) +
+                    (candidateRemoteDie == preferredDie ? 0U : 1U);
+                if (!protocolFound || score < protocolBestScore ||
+                    (score == protocolBestScore && SymmetricLinkLess(links[linkIdx], protocolBest))) {
+                    protocolBest = links[linkIdx];
+                    protocolBestScore = score;
                 }
-                found = true;
+                protocolFound = true;
             }
         }
-        if (found) {
+        if (protocolFound) {
+            selected = protocolBest;
+            selectedScore = protocolBestScore;
+            found = true;
             break;
         }
     }
@@ -134,6 +157,8 @@ HcclResult QueryBestCcuLinkToPeer(
     CHK_RET(GetEndpointDieId(comm, myRank, selected.srcEndpointDesc, localDieId));
     CHK_PRT_RET(localDieId >= BROADCAST_CCU_DIE_NUM,
         HCCL_ERROR("[QueryBestCcuLinkToPeer] invalid local die=%u", localDieId), HCCL_E_INTERNAL);
+    HCCL_DEBUG("[QueryBestCcuLinkToPeer] rank=%u peer=%u preferredDie=%u selectedDie=%u score=%u",
+        myRank, remoteRank, preferredDie, localDieId, selectedScore);
     CHK_RET(HcclChannelDescInit(&desc, 1));
     desc.remoteRank = remoteRank;
     desc.notifyNum = CHANNEL_NOTIFY_NUM;
@@ -187,6 +212,8 @@ HcclResult AcquireAllPeerChannels(
         remoteRanksByDie[localDies[i]].push_back(remoteRanks[i]);
         peerDieByRank[remoteRanks[i]] = localDies[i];
     }
+    HCCL_DEBUG("[AcquireAllPeerChannels] rank=%u die0Peers=%zu die1Peers=%zu",
+        param.myRank, channelsByDie[0].size(), channelsByDie[1].size());
     return HCCL_SUCCESS;
 }
 
