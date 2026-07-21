@@ -22,8 +22,9 @@
 #include "binary_stream.h"
 #include "common.h"
 
-constexpr uint32_t RESOURCE_LAYOUT_VERSION = 8;
+constexpr uint32_t RESOURCE_LAYOUT_VERSION = 9;
 constexpr uint32_t BROADCAST_CCU_DIE_NUM = 2;
+constexpr uint32_t BROADCAST_READY_RING_SLOTS = 8;
 constexpr uint32_t SMALL_PULL_PHASE_COUNT = 2;
 constexpr uint32_t OWNER_WRITE_PHASE_COUNT = 4;
 
@@ -131,8 +132,12 @@ struct CcuKernelArgBase {
 struct BroadcastKernelArg : public CcuKernelArgBase {
     uint32_t rankSize;
     uint32_t rankId;
+    uint32_t rootRank;
     uint32_t dieId;
+    uint32_t seedDie;
     uint32_t activeDieMask;
+    uint32_t pushWindowDepth;
+    uint32_t enablePushBatchMerge;
     uint32_t remoteRanks[MAX_RANK_SIZE];
 };
 
@@ -151,6 +156,11 @@ enum class OwnerWritePhase : uint64_t {
     PRESYNC_WAIT = 1,
     OWNER_DONE = 2,
     GLOBAL_DONE = 3,
+};
+
+enum class OwnerSeedPhase : uint64_t {
+    RUN = 0,
+    FINAL_CREDIT_DRAIN = 1,
 };
 
 struct CcuKernelInfo {
@@ -172,7 +182,10 @@ public:
 struct AlgResourceCtx {
     uint32_t version = RESOURCE_LAYOUT_VERSION;
     uint32_t rankSize = 0;
+    uint32_t rootRank = 0;
     uint32_t activeDieMask = 0;
+    uint32_t pushWindowDepth = 2;
+    uint32_t enablePushBatchMerge = 0;
     uint32_t peerDieByRank[MAX_RANK_SIZE]{};
     CommBuffer localBuffer{nullptr, 0};
     CcuKernelHandle smallPullKernels[BROADCAST_CCU_DIE_NUM]{};
@@ -183,7 +196,8 @@ struct AlgResourceCtx {
 
     static constexpr uint64_t SerializedSize()
     {
-        return sizeof(version) + sizeof(rankSize) + sizeof(activeDieMask) + sizeof(peerDieByRank) +
+        return sizeof(version) + sizeof(rankSize) + sizeof(rootRank) + sizeof(activeDieMask) +
+            sizeof(pushWindowDepth) + sizeof(enablePushBatchMerge) + sizeof(peerDieByRank) +
             sizeof(localBuffer) +
             sizeof(smallPullKernels) + sizeof(ownerWriteKernels) + sizeof(seedKernels) +
             sizeof(pushThreads) + sizeof(pushThreadCount);
@@ -194,7 +208,10 @@ struct AlgResourceCtx {
         BinaryStream binaryStream;
         binaryStream << version;
         binaryStream << rankSize;
+        binaryStream << rootRank;
         binaryStream << activeDieMask;
+        binaryStream << pushWindowDepth;
+        binaryStream << enablePushBatchMerge;
         for (uint32_t rank = 0; rank < MAX_RANK_SIZE; ++rank) {
             binaryStream << peerDieByRank[rank];
         }
@@ -216,7 +233,10 @@ struct AlgResourceCtx {
         BinaryStream binaryStream(data);
         binaryStream >> version;
         binaryStream >> rankSize;
+        binaryStream >> rootRank;
         binaryStream >> activeDieMask;
+        binaryStream >> pushWindowDepth;
+        binaryStream >> enablePushBatchMerge;
         for (uint32_t rank = 0; rank < MAX_RANK_SIZE; ++rank) {
             binaryStream >> peerDieByRank[rank];
         }

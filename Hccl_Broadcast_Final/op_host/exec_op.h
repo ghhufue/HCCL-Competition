@@ -21,13 +21,19 @@
 
 namespace ops_hccl {
 
+struct OwnerWriteConfig {
+    uint64_t tileSizeBytes = 4ULL * 1024ULL * 1024ULL;
+    bool enablePushBatchMerge = false;
+    uint64_t maxPushBatchBytes = 8ULL * 1024ULL * 1024ULL;
+    uint32_t pushWindowDepth = 2;
+};
+
 struct ChunkDesc {
     uint64_t offset = 0;
     uint64_t bytes = 0;
     OwnerBlock owner;
     uint64_t tileSizeBytes = 0;
     uint64_t seedFullTileCount = 0;
-    uint64_t seedFullBytes = 0;
     uint64_t seedTailBytes = 0;
     bool enablePushBatchMerge = false;
     uint64_t maxPushBatchBytes = 0;
@@ -40,6 +46,7 @@ struct ExecutionPlan {
     std::vector<ChunkDesc> chunks;
 };
 
+HcclResult LoadOwnerWriteConfig(OwnerWriteConfig &config);
 HcclResult BuildExecutionPlan(uint64_t totalBytes, uint32_t rankSize, uint32_t rankId, ExecutionPlan &plan);
 HcclResult LaunchSmallReceiverPullChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);

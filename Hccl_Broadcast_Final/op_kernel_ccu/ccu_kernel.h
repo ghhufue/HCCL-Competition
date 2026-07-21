@@ -23,6 +23,7 @@ namespace ccu = ::AscendC::ccu;
 namespace ops_hccl {
 
 constexpr uint32_t MAX_PUSH_WINDOW_DEPTH = 4;
+constexpr uint32_t READY_RING_SLOTS = BROADCAST_READY_RING_SLOTS;
 static_assert(MAX_RANK_SIZE <= 16, "CCU completion masks are 16-bit rank masks");
 
 constexpr uint32_t BUFFER_XN_ID = 1;
@@ -49,23 +50,18 @@ struct BroadcastContext {
     ccu::Variable ownerOffset;
     ccu::Variable ownerBytes;
     ccu::Variable tileSizeBytes;
-    ccu::Variable seedFullTileCount;
-    ccu::Variable seedFullBytes;
+    ccu::Variable seedFullGroupCount;
+    ccu::Variable seedFullRemainder;
     ccu::Variable seedTailBytes;
     ccu::Variable enablePushBatchMerge;
     ccu::Variable maxPushBatchBytes;
     ccu::Variable pushMergeFactor;
     ccu::Variable pushWindowDepth;
     ccu::Variable pushFirstBytes;
-    ccu::Variable pushLoopOffset;
-    ccu::Variable pushLoopBytes;
-    ccu::Variable pushLoopParam;
-    ccu::Variable pushLoopRemainder;
-    ccu::Variable pushTailOffset;
+    ccu::Variable pushLoopCount;
     ccu::Variable pushTailBytes;
     ccu::Variable pushTailReadyTiles;
     ccu::Variable kernelPhase;
-    ccu::Event pushEvents[MAX_PUSH_WINDOW_DEPTH];
 };
 
 CcuResult InitBroadcastResource(BroadcastContext &ctx, const BroadcastKernelArg *arg);

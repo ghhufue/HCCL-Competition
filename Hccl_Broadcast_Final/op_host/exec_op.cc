@@ -30,20 +30,6 @@ constexpr uint32_t DEFAULT_PUSH_WINDOW_DEPTH = 2;
 constexpr uint64_t MAX_LOOP_ITERATIONS = 8191;
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 
-struct OwnerWriteConfig {
-    uint64_t tileSizeBytes = DEFAULT_TILE_SIZE_BYTES;
-    bool enablePushBatchMerge = false;
-    uint64_t maxPushBatchBytes = DEFAULT_MAX_PUSH_BATCH_BYTES;
-    uint32_t pushWindowDepth = DEFAULT_PUSH_WINDOW_DEPTH;
-};
-
-uint64_t PackLoopParam(uint64_t addressOffset, uint64_t iterations)
-{
-    constexpr uint64_t addressMask = (1ULL << 32) - 1;
-    constexpr uint64_t iterationMask = (1ULL << 13) - 1;
-    return ((addressOffset & addressMask) << 13) | (iterations & iterationMask);
-}
-
 HcclResult ParseBoolEnv(const char *name, bool defaultValue, bool &value)
 {
     const char *text = std::getenv(name);
@@ -81,7 +67,7 @@ HcclResult ParseSizeEnv(const char *name, uint64_t defaultValue, uint64_t &value
     return HCCL_SUCCESS;
 }
 
-HcclResult LoadOwnerWriteConfig(OwnerWriteConfig &config)
+HcclResult LoadOwnerWriteConfigImpl(OwnerWriteConfig &config)
 {
     CHK_RET(ParseSizeEnv("HCCL_BROADCAST_TILE_SIZE_BYTES", DEFAULT_TILE_SIZE_BYTES, config.tileSizeBytes));
     CHK_RET(ParseBoolEnv(
@@ -146,25 +132,47 @@ uint32_t ActiveDieCount(uint32_t dieMask)
     return count;
 }
 
+HcclResult StartPushThreads(
+    const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask)
+{
+    const uint32_t expected = ActiveDieCount(dieMask);
+    CHK_PRT_RET(expected == 0 || expected > resCtx.pushThreadCount ||
+            (dieMask & ~resCtx.activeDieMask) != 0,
+        HCCL_ERROR("[StartPushThreads] invalid dieMask=%u activeDieMask=%u pushThreadCount=%u",
+            dieMask, resCtx.activeDieMask, resCtx.pushThreadCount), HCCL_E_INTERNAL);
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((dieMask & (1U << dieId)) == 0) {
+            continue;
+        }
+        CHK_RET(HcommThreadNotifyRecordOnThread(
+            param.cpuThread, resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX));
+    }
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((dieMask & (1U << dieId)) == 0) {
+            continue;
+        }
+        CHK_RET(HcommThreadNotifyWaitOnThread(
+            resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
+    }
+    return HCCL_SUCCESS;
+}
+
 HcclResult LaunchKernel(ThreadHandle thread, const OpParam &param, CcuKernelHandle kernel,
     uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk, uint64_t phase, bool ownerWriteArgs)
 {
     std::vector<uint64_t> taskArgs;
     if (!ownerWriteArgs) {
-        taskArgs = {baseAddr, token, param.root, chunk.offset, chunk.bytes, 0, 0, 0, phase};
+        taskArgs = {baseAddr, token, param.root, chunk.offset, chunk.bytes, phase};
     } else {
-        const uint64_t fullWindowCount = chunk.push.loopCount / chunk.pushWindowDepth;
-        const uint64_t windowLoopBytes = fullWindowCount * chunk.pushWindowDepth * chunk.push.loopBatchBytes;
-        const uint64_t windowRemainder = chunk.push.loopCount % chunk.pushWindowDepth;
         taskArgs = {baseAddr, token, param.root,
             chunk.owner.offset, chunk.owner.bytes, chunk.tileSizeBytes,
-            chunk.seedFullTileCount, chunk.seedFullBytes, chunk.seedTailBytes,
+            chunk.seedFullTileCount / BROADCAST_READY_RING_SLOTS,
+            chunk.seedFullTileCount % BROADCAST_READY_RING_SLOTS,
+            chunk.seedTailBytes,
             chunk.enablePushBatchMerge ? 1ULL : 0ULL, chunk.maxPushBatchBytes,
             chunk.maxPushBatchBytes / chunk.tileSizeBytes,
-            chunk.pushWindowDepth, chunk.push.firstBytes, chunk.push.loopOffset, windowLoopBytes,
-            PackLoopParam(chunk.push.loopBatchBytes * chunk.pushWindowDepth, fullWindowCount),
-            windowRemainder,
-            chunk.push.tailOffset, chunk.push.tailBytes, chunk.push.tailReadyTiles, phase};
+            chunk.pushWindowDepth, chunk.push.firstBytes, chunk.push.loopCount,
+            chunk.push.tailBytes, chunk.push.tailReadyTiles, phase};
     }
     const CcuResult ret = HcommCcuKernelLaunch(
         thread, kernel, taskArgs.data(), static_cast<uint32_t>(taskArgs.size()));
@@ -243,6 +251,11 @@ uint32_t GetSeedDie(const OpParam &param, const AlgResourceCtx &resCtx)
 
 } // namespace
 
+HcclResult LoadOwnerWriteConfig(OwnerWriteConfig &config)
+{
+    return LoadOwnerWriteConfigImpl(config);
+}
+
 HcclResult BuildExecutionPlan(
     uint64_t totalBytes, uint32_t rankSize, uint32_t rankId, ExecutionPlan &plan)
 {
@@ -268,8 +281,7 @@ HcclResult BuildExecutionPlan(
         CHK_PRT_RET(fullTileCount > MAX_LOOP_ITERATIONS,
             HCCL_ERROR("[BuildExecutionPlan] owner block needs too many Tile iterations=%llu",
                 static_cast<unsigned long long>(fullTileCount)), HCCL_E_PARA);
-        chunk.seedFullBytes = fullTileCount * config.tileSizeBytes;
-        chunk.seedTailBytes = chunk.owner.bytes - chunk.seedFullBytes;
+        chunk.seedTailBytes = chunk.owner.bytes - fullTileCount * config.tileSizeBytes;
         chunk.seedFullTileCount = fullTileCount;
         chunk.push = BuildPushBatchPlan(chunk.owner.bytes, config.tileSizeBytes,
             config.enablePushBatchMerge, config.maxPushBatchBytes);
@@ -286,6 +298,7 @@ HcclResult LaunchSmallReceiverPullChunk(
 {
     uint32_t dieMask = 0;
     CHK_RET(GetSmallPullDieMask(param, resCtx, dieMask));
+    CHK_RET(StartPushThreads(param, resCtx, dieMask));
     for (uint32_t phase = 0; phase < SMALL_PULL_PHASE_COUNT; ++phase) {
         CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, dieMask, resCtx.smallPullKernels,
             baseAddr, token, chunk, phase, false));
@@ -296,6 +309,7 @@ HcclResult LaunchSmallReceiverPullChunk(
 HcclResult LaunchContiguousOwnerWriteChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk)
 {
+    CHK_RET(StartPushThreads(param, resCtx, resCtx.activeDieMask));
     CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, resCtx.activeDieMask, resCtx.ownerWriteKernels,
         baseAddr, token, chunk, static_cast<uint64_t>(OwnerWritePhase::PRESYNC_PUBLISH), true));
     CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, resCtx.activeDieMask, resCtx.ownerWriteKernels,
@@ -305,15 +319,26 @@ HcclResult LaunchContiguousOwnerWriteChunk(
     CHK_PRT_RET(seedDie >= BROADCAST_CCU_DIE_NUM || resCtx.seedKernels[seedDie] == 0,
         HCCL_ERROR("[LaunchContiguousOwnerWriteChunk] invalid seed die=%u", seedDie), HCCL_E_INTERNAL);
     CHK_RET(LaunchKernel(param.cpuThread, param, resCtx.seedKernels[seedDie], baseAddr, token,
-        chunk, 0, true));
+        chunk, static_cast<uint64_t>(OwnerSeedPhase::RUN), true));
+    CHK_RET(LaunchKernel(resCtx.pushThreads[seedDie], param, resCtx.ownerWriteKernels[seedDie],
+        baseAddr, token, chunk, OWNER_WRITE_PHASE_COUNT, true));
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) == 0) {
+        if ((resCtx.activeDieMask & (1U << dieId)) == 0 || dieId == seedDie) {
             continue;
         }
+        // CcuLocalNotify is Die-local on the checker/runtime. Keep the Seed
+        // Die on the Tile-ready pipeline and release the other Die once the
+        // complete owner block has been pulled into local memory.
+        CHK_RET(HcommThreadNotifyRecordOnThread(
+            param.cpuThread, resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX));
+        CHK_RET(HcommThreadNotifyWaitOnThread(
+            resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
         CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, resCtx.ownerWriteKernels[dieId],
             baseAddr, token, chunk, OWNER_WRITE_PHASE_COUNT, true));
     }
     CHK_RET(JoinPushThreads(param, resCtx, resCtx.activeDieMask));
+    CHK_RET(LaunchKernel(param.cpuThread, param, resCtx.seedKernels[seedDie], baseAddr, token,
+        chunk, static_cast<uint64_t>(OwnerSeedPhase::FINAL_CREDIT_DRAIN), true));
 
     CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, resCtx.activeDieMask, resCtx.ownerWriteKernels,
         baseAddr, token, chunk, static_cast<uint64_t>(OwnerWritePhase::OWNER_DONE), true));
@@ -339,6 +364,9 @@ HcclResult ExecOp(const OpParam &param, aclrtStream stream)
     CHK_PRT_RET(resCtx.rankSize != param.rankSize,
         HCCL_ERROR("[ExecOp] context rankSize=%u does not match call rankSize=%u",
             resCtx.rankSize, param.rankSize), HCCL_E_INTERNAL);
+    CHK_PRT_RET(resCtx.rootRank != param.root,
+        HCCL_ERROR("[ExecOp] context root=%u does not match call root=%u",
+            resCtx.rootRank, param.root), HCCL_E_INTERNAL);
     const uint32_t activeCount = ActiveDieCount(resCtx.activeDieMask);
     CHK_PRT_RET(activeCount == 0 || activeCount != resCtx.pushThreadCount,
         HCCL_ERROR("[ExecOp] activeDieMask=%u does not match pushThreadCount=%u",
@@ -356,6 +384,14 @@ HcclResult ExecOp(const OpParam &param, aclrtStream stream)
     ExecutionPlan plan;
     CHK_RET(BuildExecutionPlan(totalBytes, param.rankSize, param.myRank, plan));
     const ChunkDesc &chunk = plan.chunks.front();
+    if (plan.algorithm == KernelKind::CONTIGUOUS_OWNER_WRITE) {
+        CHK_PRT_RET(chunk.pushWindowDepth != resCtx.pushWindowDepth ||
+                static_cast<uint32_t>(chunk.enablePushBatchMerge) != resCtx.enablePushBatchMerge,
+            HCCL_ERROR("[ExecOp] owner-write config changed after kernel registration: "
+                       "depth=%u/%u merge=%u/%u",
+                chunk.pushWindowDepth, resCtx.pushWindowDepth,
+                chunk.enablePushBatchMerge ? 1U : 0U, resCtx.enablePushBatchMerge), HCCL_E_PARA);
+    }
     const uint64_t pushFullWindows = chunk.pushWindowDepth == 0 ? 0 :
         chunk.push.loopCount / chunk.pushWindowDepth;
     const uint64_t pushWindowRemainder = chunk.pushWindowDepth == 0 ? 0 :
