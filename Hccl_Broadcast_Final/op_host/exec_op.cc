@@ -26,6 +26,7 @@ constexpr uint64_t FP32_ALIGNMENT = sizeof(float);
 constexpr uint64_t SMALL_PULL_THRESHOLD_BYTES = 512ULL * 1024ULL;
 constexpr uint64_t DEFAULT_TILE_SIZE_BYTES = 4ULL * 1024ULL * 1024ULL;
 constexpr uint64_t DEFAULT_MAX_PUSH_BATCH_BYTES = 8ULL * 1024ULL * 1024ULL;
+constexpr uint32_t DEFAULT_PUSH_WINDOW_DEPTH = 2;
 constexpr uint64_t MAX_LOOP_ITERATIONS = 8191;
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 
@@ -33,6 +34,7 @@ struct OwnerWriteConfig {
     uint64_t tileSizeBytes = DEFAULT_TILE_SIZE_BYTES;
     bool enablePushBatchMerge = false;
     uint64_t maxPushBatchBytes = DEFAULT_MAX_PUSH_BATCH_BYTES;
+    uint32_t pushWindowDepth = DEFAULT_PUSH_WINDOW_DEPTH;
 };
 
 uint64_t PackLoopParam(uint64_t addressOffset, uint64_t iterations)
@@ -86,6 +88,12 @@ HcclResult LoadOwnerWriteConfig(OwnerWriteConfig &config)
         "HCCL_BROADCAST_ENABLE_PUSH_BATCH_MERGE", false, config.enablePushBatchMerge));
     CHK_RET(ParseSizeEnv("HCCL_BROADCAST_MAX_PUSH_BATCH_BYTES",
         DEFAULT_MAX_PUSH_BATCH_BYTES, config.maxPushBatchBytes));
+    uint64_t pushWindowDepth = DEFAULT_PUSH_WINDOW_DEPTH;
+    CHK_RET(ParseSizeEnv("HCCL_BROADCAST_PUSH_WINDOW_DEPTH", DEFAULT_PUSH_WINDOW_DEPTH, pushWindowDepth));
+    CHK_PRT_RET(pushWindowDepth != 1 && pushWindowDepth != 2 && pushWindowDepth != 4,
+        HCCL_ERROR("[LoadOwnerWriteConfig] HCCL_BROADCAST_PUSH_WINDOW_DEPTH must be 1, 2, or 4; got %llu",
+            static_cast<unsigned long long>(pushWindowDepth)), HCCL_E_PARA);
+    config.pushWindowDepth = static_cast<uint32_t>(pushWindowDepth);
     CHK_PRT_RET(config.tileSizeBytes % FP32_ALIGNMENT != 0 || config.tileSizeBytes > MAX_DATA_SIZE,
         HCCL_ERROR("[LoadOwnerWriteConfig] invalid tileSizeBytes=%llu",
             static_cast<unsigned long long>(config.tileSizeBytes)), HCCL_E_PARA);
@@ -145,13 +153,17 @@ HcclResult LaunchKernel(ThreadHandle thread, const OpParam &param, CcuKernelHand
     if (!ownerWriteArgs) {
         taskArgs = {baseAddr, token, param.root, chunk.offset, chunk.bytes, 0, 0, 0, phase};
     } else {
+        const uint64_t fullWindowCount = chunk.push.loopCount / chunk.pushWindowDepth;
+        const uint64_t windowLoopBytes = fullWindowCount * chunk.pushWindowDepth * chunk.push.loopBatchBytes;
+        const uint64_t windowRemainder = chunk.push.loopCount % chunk.pushWindowDepth;
         taskArgs = {baseAddr, token, param.root,
             chunk.owner.offset, chunk.owner.bytes, chunk.tileSizeBytes,
-            chunk.seedLoopParam, chunk.seedFullBytes, chunk.seedTailBytes,
+            chunk.seedFullTileCount, chunk.seedFullBytes, chunk.seedTailBytes,
             chunk.enablePushBatchMerge ? 1ULL : 0ULL, chunk.maxPushBatchBytes,
             chunk.maxPushBatchBytes / chunk.tileSizeBytes,
-            chunk.push.firstBytes, chunk.push.loopOffset, chunk.push.loopBytes,
-            PackLoopParam(chunk.push.loopBatchBytes, chunk.push.loopCount),
+            chunk.pushWindowDepth, chunk.push.firstBytes, chunk.push.loopOffset, windowLoopBytes,
+            PackLoopParam(chunk.push.loopBatchBytes * chunk.pushWindowDepth, fullWindowCount),
+            windowRemainder,
             chunk.push.tailOffset, chunk.push.tailBytes, chunk.push.tailReadyTiles, phase};
     }
     const CcuResult ret = HcommCcuKernelLaunch(
@@ -250,6 +262,7 @@ HcclResult BuildExecutionPlan(
         chunk.tileSizeBytes = config.tileSizeBytes;
         chunk.enablePushBatchMerge = config.enablePushBatchMerge;
         chunk.maxPushBatchBytes = config.maxPushBatchBytes;
+        chunk.pushWindowDepth = config.pushWindowDepth;
         chunk.owner = GetOwnerBlock(totalBytes, rankSize, rankId, config.tileSizeBytes);
         const uint64_t fullTileCount = chunk.owner.bytes / config.tileSizeBytes;
         CHK_PRT_RET(fullTileCount > MAX_LOOP_ITERATIONS,
@@ -257,7 +270,7 @@ HcclResult BuildExecutionPlan(
                 static_cast<unsigned long long>(fullTileCount)), HCCL_E_PARA);
         chunk.seedFullBytes = fullTileCount * config.tileSizeBytes;
         chunk.seedTailBytes = chunk.owner.bytes - chunk.seedFullBytes;
-        chunk.seedLoopParam = PackLoopParam(config.tileSizeBytes, fullTileCount);
+        chunk.seedFullTileCount = fullTileCount;
         chunk.push = BuildPushBatchPlan(chunk.owner.bytes, config.tileSizeBytes,
             config.enablePushBatchMerge, config.maxPushBatchBytes);
         CHK_PRT_RET(chunk.push.loopCount > MAX_LOOP_ITERATIONS,
@@ -343,13 +356,21 @@ HcclResult ExecOp(const OpParam &param, aclrtStream stream)
     ExecutionPlan plan;
     CHK_RET(BuildExecutionPlan(totalBytes, param.rankSize, param.myRank, plan));
     const ChunkDesc &chunk = plan.chunks.front();
+    const uint64_t pushFullWindows = chunk.pushWindowDepth == 0 ? 0 :
+        chunk.push.loopCount / chunk.pushWindowDepth;
+    const uint64_t pushWindowRemainder = chunk.pushWindowDepth == 0 ? 0 :
+        chunk.push.loopCount % chunk.pushWindowDepth;
     HCCL_DEBUG("[ExecOp] rank=%u root=%u bytes=%llu activeDieMask=%u algorithm=%s "
-               "ownerOffset=%llu ownerBytes=%llu tileSize=%llu merge=%u maxBatch=%llu",
+               "ownerOffset=%llu ownerBytes=%llu tileSize=%llu merge=%u maxBatch=%llu "
+               "pushWindowDepth=%u pushLoopBatches=%llu pushFullWindows=%llu pushWindowRemainder=%llu",
         param.myRank, param.root, static_cast<unsigned long long>(totalBytes), resCtx.activeDieMask,
         KernelKindName(plan.algorithm), static_cast<unsigned long long>(chunk.owner.offset),
         static_cast<unsigned long long>(chunk.owner.bytes),
         static_cast<unsigned long long>(chunk.tileSizeBytes), chunk.enablePushBatchMerge ? 1U : 0U,
-        static_cast<unsigned long long>(chunk.maxPushBatchBytes));
+        static_cast<unsigned long long>(chunk.maxPushBatchBytes), chunk.pushWindowDepth,
+        static_cast<unsigned long long>(chunk.push.loopCount),
+        static_cast<unsigned long long>(pushFullWindows),
+        static_cast<unsigned long long>(pushWindowRemainder));
 
     const uint64_t baseAddr = reinterpret_cast<uint64_t>(param.outputPtr);
     uint64_t token = 0;

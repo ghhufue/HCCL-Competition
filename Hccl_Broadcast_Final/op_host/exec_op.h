@@ -26,11 +26,12 @@ struct ChunkDesc {
     uint64_t bytes = 0;
     OwnerBlock owner;
     uint64_t tileSizeBytes = 0;
-    uint64_t seedLoopParam = 0;
+    uint64_t seedFullTileCount = 0;
     uint64_t seedFullBytes = 0;
     uint64_t seedTailBytes = 0;
     bool enablePushBatchMerge = false;
     uint64_t maxPushBatchBytes = 0;
+    uint32_t pushWindowDepth = 2;
     PushBatchPlan push;
 };
 
