@@ -277,14 +277,27 @@ HcclResult BuildExecutionPlan(
         chunk.maxPushBatchBytes = config.maxPushBatchBytes;
         chunk.pushWindowDepth = config.pushWindowDepth;
         chunk.owner = GetOwnerBlock(totalBytes, rankSize, rankId, config.tileSizeBytes);
-        const uint64_t fullTileCount = chunk.owner.bytes / config.tileSizeBytes;
+        // The single-Die 4-rank topology forms a checker dependency cycle when
+        // Seed reuses a Ready bit and waits for Push credit. Keep its complete
+        // owner block within one Ready ring; larger topologies retain the tuned
+        // Tile size and cross-batch credit pipeline.
+        if (rankSize == 4 && chunk.owner.tileCount > BROADCAST_READY_RING_SLOTS) {
+            const uint64_t minimumTileBytes = DivideRoundUp(
+                chunk.owner.bytes, BROADCAST_READY_RING_SLOTS);
+            const uint64_t alignedTileBytes = DivideRoundUp(
+                minimumTileBytes, config.tileSizeBytes) * config.tileSizeBytes;
+            chunk.tileSizeBytes = std::max(config.tileSizeBytes, alignedTileBytes);
+            chunk.maxPushBatchBytes = std::max(config.maxPushBatchBytes, chunk.tileSizeBytes);
+            chunk.owner = GetOwnerBlock(totalBytes, rankSize, rankId, chunk.tileSizeBytes);
+        }
+        const uint64_t fullTileCount = chunk.owner.bytes / chunk.tileSizeBytes;
         CHK_PRT_RET(fullTileCount > MAX_LOOP_ITERATIONS,
             HCCL_ERROR("[BuildExecutionPlan] owner block needs too many Tile iterations=%llu",
                 static_cast<unsigned long long>(fullTileCount)), HCCL_E_PARA);
-        chunk.seedTailBytes = chunk.owner.bytes - fullTileCount * config.tileSizeBytes;
+        chunk.seedTailBytes = chunk.owner.bytes - fullTileCount * chunk.tileSizeBytes;
         chunk.seedFullTileCount = fullTileCount;
-        chunk.push = BuildPushBatchPlan(chunk.owner.bytes, config.tileSizeBytes,
-            config.enablePushBatchMerge, config.maxPushBatchBytes);
+        chunk.push = BuildPushBatchPlan(chunk.owner.bytes, chunk.tileSizeBytes,
+            config.enablePushBatchMerge, chunk.maxPushBatchBytes);
         CHK_PRT_RET(chunk.push.loopCount > MAX_LOOP_ITERATIONS,
             HCCL_ERROR("[BuildExecutionPlan] owner push needs too many loop iterations=%llu",
                 static_cast<unsigned long long>(chunk.push.loopCount)), HCCL_E_PARA);
