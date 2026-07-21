@@ -33,7 +33,7 @@ namespace {
 
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t THREAD_NOTIFY_NUM = 1;
-constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v6";
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v7";
 
 HcclResult ValidateBroadcastParam(const OpParam &param)
 {
@@ -235,11 +235,11 @@ HcclResult RegisterBroadcastKernels(HcclComm comm, const OpParam &param,
             continue;
         }
         resCtx.activeDieMask |= 1U << dieId;
-        auto directArg = BuildKernelArg(param, channelsByDie[dieId], remoteRanksByDie[dieId]);
+        auto smallPullArg = BuildKernelArg(param, channelsByDie[dieId], remoteRanksByDie[dieId]);
         auto pullArg = BuildKernelArg(param, channelsByDie[dieId], remoteRanksByDie[dieId]);
-        ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastDirectKernel",
-            reinterpret_cast<void *>(ops_hccl::CcuBroadcastDirectKernel), directArg,
-            resCtx.directKernels[dieId]);
+        ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastSmallReceiverPullKernel",
+            reinterpret_cast<void *>(ops_hccl::CcuBroadcastSmallReceiverPullKernel), smallPullArg,
+            resCtx.smallPullKernels[dieId]);
         if (ret == HCCL_SUCCESS) {
             ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastPullScatterAllGatherKernel",
                 reinterpret_cast<void *>(ops_hccl::CcuBroadcastPullScatterAllGatherKernel), pullArg,

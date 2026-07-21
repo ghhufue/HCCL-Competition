@@ -21,9 +21,9 @@
 #include "binary_stream.h"
 #include "common.h"
 
-constexpr uint32_t RESOURCE_LAYOUT_VERSION = 6;
+constexpr uint32_t RESOURCE_LAYOUT_VERSION = 7;
 constexpr uint32_t BROADCAST_CCU_DIE_NUM = 2;
-constexpr uint32_t DIRECT_PHASE_COUNT = 3;
+constexpr uint32_t SMALL_PULL_PHASE_COUNT = 2;
 constexpr uint32_t PULL_PHASE_COUNT = 7;
 
 typedef struct {
@@ -43,8 +43,13 @@ struct BroadcastKernelArg : public CcuKernelArgBase {
 };
 
 enum class KernelKind : uint32_t {
-    DIRECT = 0,
+    SMALL_RECEIVER_PULL = 0,
     PULL_SCATTER_ALLGATHER = 1,
+};
+
+enum class SmallPullPhase : uint64_t {
+    TRANSFER = 0,
+    GLOBAL_DONE = 1,
 };
 
 enum class PullPhase : uint64_t {
@@ -55,12 +60,6 @@ enum class PullPhase : uint64_t {
     ALLGATHER = 4,
     READ_DONE = 5,
     GLOBAL_DONE = 6,
-};
-
-enum class DirectPhase : uint64_t {
-    PRESYNC_PUBLISH = 0,
-    PRESYNC_WAIT = 1,
-    DATA = 2,
 };
 
 struct CcuKernelInfo {
@@ -85,7 +84,7 @@ struct AlgResourceCtx {
     uint32_t activeDieMask = 0;
     uint32_t peerDieByRank[MAX_RANK_SIZE]{};
     CommBuffer localBuffer{nullptr, 0};
-    CcuKernelHandle directKernels[BROADCAST_CCU_DIE_NUM]{};
+    CcuKernelHandle smallPullKernels[BROADCAST_CCU_DIE_NUM]{};
     CcuKernelHandle pullKernels[BROADCAST_CCU_DIE_NUM]{};
     ThreadHandle slaveThread = 0;
     uint32_t slaveThreadCount = 0;
@@ -94,7 +93,7 @@ struct AlgResourceCtx {
     {
         return sizeof(version) + sizeof(rankSize) + sizeof(activeDieMask) + sizeof(peerDieByRank) +
             sizeof(localBuffer) +
-            sizeof(directKernels) + sizeof(pullKernels) + sizeof(slaveThread) + sizeof(slaveThreadCount);
+            sizeof(smallPullKernels) + sizeof(pullKernels) + sizeof(slaveThread) + sizeof(slaveThreadCount);
     }
 
     std::vector<char> Serialize() const
@@ -108,7 +107,7 @@ struct AlgResourceCtx {
         }
         binaryStream << localBuffer;
         for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-            binaryStream << directKernels[dieId];
+            binaryStream << smallPullKernels[dieId];
             binaryStream << pullKernels[dieId];
         }
         binaryStream << slaveThread;
@@ -129,7 +128,7 @@ struct AlgResourceCtx {
         }
         binaryStream >> localBuffer;
         for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-            binaryStream >> directKernels[dieId];
+            binaryStream >> smallPullKernels[dieId];
             binaryStream >> pullKernels[dieId];
         }
         binaryStream >> slaveThread;

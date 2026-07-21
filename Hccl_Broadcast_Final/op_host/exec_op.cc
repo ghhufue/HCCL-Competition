@@ -26,7 +26,7 @@ namespace ops_hccl {
 namespace {
 
 constexpr uint64_t FP32_ALIGNMENT = sizeof(float);
-constexpr uint64_t AUTO_DIRECT_THRESHOLD_BYTES = 512ULL * 1024ULL;
+constexpr uint64_t SMALL_PULL_THRESHOLD_BYTES = 512ULL * 1024ULL;
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 
 HcclResult LaunchChunk(ThreadHandle thread, const OpParam &param, CcuKernelHandle kernel, uint64_t baseAddr,
@@ -55,19 +55,22 @@ HcclResult LaunchChunk(ThreadHandle thread, const OpParam &param, CcuKernelHandl
     return HCCL_SUCCESS;
 }
 
-HcclResult BuildDieLaunchOrder(const OpParam &param, const AlgResourceCtx &resCtx,
+HcclResult BuildDieLaunchOrder(const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask,
     uint32_t (&dieOrder)[BROADCAST_CCU_DIE_NUM], uint32_t &dieCount)
 {
+    CHK_PRT_RET(dieMask == 0 || (dieMask & ~resCtx.activeDieMask) != 0,
+        HCCL_ERROR("[BuildDieLaunchOrder] invalid die mask=%u activeDieMask=%u", dieMask, resCtx.activeDieMask),
+        HCCL_E_INTERNAL);
     dieCount = 0;
     if (param.myRank != param.root) {
         const uint32_t rootDie = resCtx.peerDieByRank[param.root];
         CHK_PRT_RET(rootDie >= BROADCAST_CCU_DIE_NUM ||
-                (resCtx.activeDieMask & (1U << rootDie)) == 0,
+                (dieMask & (1U << rootDie)) == 0,
             HCCL_ERROR("[BuildDieLaunchOrder] invalid root channel die=%u", rootDie), HCCL_E_INTERNAL);
         dieOrder[dieCount++] = rootDie;
     }
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) == 0 ||
+        if ((dieMask & (1U << dieId)) == 0 ||
             (dieCount != 0 && dieOrder[0] == dieId)) {
             continue;
         }
@@ -78,19 +81,19 @@ HcclResult BuildDieLaunchOrder(const OpParam &param, const AlgResourceCtx &resCt
     return HCCL_SUCCESS;
 }
 
-HcclResult LaunchPhaseOnDies(const OpParam &param, const AlgResourceCtx &resCtx,
+HcclResult LaunchPhaseOnDieMask(const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask,
     const CcuKernelHandle (&kernels)[BROADCAST_CCU_DIE_NUM], uint64_t baseAddr, uint64_t token,
     const ChunkDesc &chunk, uint64_t phase)
 {
     uint32_t dieOrder[BROADCAST_CCU_DIE_NUM]{};
     uint32_t dieCount = 0;
-    CHK_RET(BuildDieLaunchOrder(param, resCtx, dieOrder, dieCount));
+    CHK_RET(BuildDieLaunchOrder(param, resCtx, dieMask, dieOrder, dieCount));
     if (dieCount == 1) {
         return LaunchChunk(param.cpuThread, param, kernels[dieOrder[0]], baseAddr, token, chunk, &phase);
     }
 
     CHK_PRT_RET(resCtx.slaveThreadCount != 1 || resCtx.slaveThread == 0,
-        HCCL_ERROR("[LaunchPhaseOnDies] invalid slave resource, count=%u handle=%llu",
+        HCCL_ERROR("[LaunchPhaseOnDieMask] invalid slave resource, count=%u handle=%llu",
             resCtx.slaveThreadCount, static_cast<unsigned long long>(resCtx.slaveThread)),
         HCCL_E_INTERNAL);
 
@@ -102,9 +105,25 @@ HcclResult LaunchPhaseOnDies(const OpParam &param, const AlgResourceCtx &resCtx,
     CHK_RET(LaunchChunk(resCtx.slaveThread, param, kernels[slaveDie], baseAddr, token, chunk, &phase));
     CHK_RET(HcommThreadNotifyRecordOnThread(resCtx.slaveThread, param.cpuThread, THREAD_NOTIFY_INDEX));
     CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread, THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
-    HCCL_DEBUG("[LaunchPhaseOnDies] rank=%u root=%u mainDie=%u slaveDie=%u phase=%llu offset=%llu bytes=%llu",
-        param.myRank, param.root, mainDie, slaveDie, static_cast<unsigned long long>(phase),
+    HCCL_DEBUG("[LaunchPhaseOnDieMask] rank=%u root=%u dieMask=%u mainDie=%u slaveDie=%u phase=%llu "
+               "offset=%llu bytes=%llu",
+        param.myRank, param.root, dieMask, mainDie, slaveDie, static_cast<unsigned long long>(phase),
         static_cast<unsigned long long>(chunk.offset), static_cast<unsigned long long>(chunk.bytes));
+    return HCCL_SUCCESS;
+}
+
+HcclResult GetSmallPullDieMask(const OpParam &param, const AlgResourceCtx &resCtx, uint32_t &dieMask)
+{
+    if (param.myRank == param.root) {
+        dieMask = resCtx.activeDieMask;
+        return HCCL_SUCCESS;
+    }
+
+    const uint32_t rootDie = resCtx.peerDieByRank[param.root];
+    CHK_PRT_RET(rootDie >= BROADCAST_CCU_DIE_NUM ||
+            (resCtx.activeDieMask & (1U << rootDie)) == 0,
+        HCCL_ERROR("[GetSmallPullDieMask] invalid root channel die=%u", rootDie), HCCL_E_INTERNAL);
+    dieMask = 1U << rootDie;
     return HCCL_SUCCESS;
 }
 
@@ -112,12 +131,12 @@ HcclResult SelectAlgorithm(uint64_t totalBytes, KernelKind &algorithm)
 {
     const char *requested = std::getenv("HCCL_BROADCAST_ALGO");
     if (requested == nullptr || requested[0] == '\0' || std::strcmp(requested, "auto") == 0) {
-        algorithm = totalBytes <= AUTO_DIRECT_THRESHOLD_BYTES ? KernelKind::DIRECT :
-                                                                 KernelKind::PULL_SCATTER_ALLGATHER;
+        algorithm = totalBytes <= SMALL_PULL_THRESHOLD_BYTES ? KernelKind::SMALL_RECEIVER_PULL :
+                                                               KernelKind::PULL_SCATTER_ALLGATHER;
         return HCCL_SUCCESS;
     }
-    if (std::strcmp(requested, "direct") == 0) {
-        algorithm = KernelKind::DIRECT;
+    if (std::strcmp(requested, "small_pull") == 0) {
+        algorithm = KernelKind::SMALL_RECEIVER_PULL;
         return HCCL_SUCCESS;
     }
     if (std::strcmp(requested, "pull") == 0) {
@@ -126,6 +145,12 @@ HcclResult SelectAlgorithm(uint64_t totalBytes, KernelKind &algorithm)
     }
     HCCL_ERROR("[SelectAlgorithm] unsupported HCCL_BROADCAST_ALGO=%s", requested);
     return HCCL_E_PARA;
+}
+
+const char *KernelKindName(KernelKind algorithm)
+{
+    return algorithm == KernelKind::SMALL_RECEIVER_PULL ? "SMALL_RECEIVER_PULL" :
+                                                         "PULL_SCATTER_ALLGATHER";
 }
 
 bool SyncEachChunkForDebug()
@@ -167,17 +192,14 @@ HcclResult BuildExecutionPlan(uint64_t totalBytes, uint32_t rankSize, ExecutionP
     return HCCL_SUCCESS;
 }
 
-HcclResult LaunchDirectChunk(
+HcclResult LaunchSmallReceiverPullChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk)
 {
-    ChunkDesc directChunk = chunk;
-    directChunk.sliceStride = chunk.bytes;
-    directChunk.activeSlices = 1;
-    directChunk.tailBytes = chunk.bytes;
-    for (uint32_t phase = 0; phase < DIRECT_PHASE_COUNT; ++phase) {
-        const uint64_t directPhase = phase;
-        CHK_RET(LaunchPhaseOnDies(
-            param, resCtx, resCtx.directKernels, baseAddr, token, directChunk, directPhase));
+    uint32_t dieMask = 0;
+    CHK_RET(GetSmallPullDieMask(param, resCtx, dieMask));
+    for (uint32_t phase = 0; phase < SMALL_PULL_PHASE_COUNT; ++phase) {
+        CHK_RET(LaunchPhaseOnDieMask(param, resCtx, dieMask, resCtx.smallPullKernels,
+            baseAddr, token, chunk, static_cast<uint64_t>(phase)));
     }
     return HCCL_SUCCESS;
 }
@@ -185,7 +207,7 @@ HcclResult LaunchDirectChunk(
 HcclResult LaunchPhaseAcrossDies(const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr,
     uint64_t token, const ChunkDesc &chunk, PullPhase phase)
 {
-    return LaunchPhaseOnDies(param, resCtx, resCtx.pullKernels, baseAddr, token, chunk,
+    return LaunchPhaseOnDieMask(param, resCtx, resCtx.activeDieMask, resCtx.pullKernels, baseAddr, token, chunk,
         static_cast<uint64_t>(phase));
 }
 
@@ -237,9 +259,9 @@ HcclResult ExecOp(const OpParam &param, aclrtStream stream)
 
     ExecutionPlan plan;
     CHK_RET(BuildExecutionPlan(totalBytes, param.rankSize, plan));
-    HCCL_DEBUG("[ExecOp] rank=%u root=%u bytes=%llu activeDieMask=%u algorithm=%u chunks=%zu", param.myRank,
+    HCCL_DEBUG("[ExecOp] rank=%u root=%u bytes=%llu activeDieMask=%u algorithm=%s chunks=%zu", param.myRank,
         param.root, static_cast<unsigned long long>(totalBytes), resCtx.activeDieMask,
-        static_cast<uint32_t>(plan.algorithm), plan.chunks.size());
+        KernelKindName(plan.algorithm), plan.chunks.size());
 
     const uint64_t baseAddr = reinterpret_cast<uint64_t>(param.outputPtr);
     uint64_t token = 0;
@@ -248,8 +270,8 @@ HcclResult ExecOp(const OpParam &param, aclrtStream stream)
     for (const auto &chunk : plan.chunks) {
         CHK_PRT_RET(chunk.bytes == 0 || chunk.bytes > MAX_DATA_SIZE || chunk.offset > totalBytes - chunk.bytes,
             HCCL_ERROR("[ExecOp] invalid chunk boundary"), HCCL_E_INTERNAL);
-        if (plan.algorithm == KernelKind::DIRECT) {
-            CHK_RET(LaunchDirectChunk(param, resCtx, baseAddr, token, chunk));
+        if (plan.algorithm == KernelKind::SMALL_RECEIVER_PULL) {
+            CHK_RET(LaunchSmallReceiverPullChunk(param, resCtx, baseAddr, token, chunk));
         } else {
             CHK_RET(LaunchPullScatterAllGatherChunk(param, resCtx, baseAddr, token, chunk));
         }

@@ -74,44 +74,6 @@ CcuResult NotifyRoot(BroadcastContext &ctx, uint32_t mask, bool wait)
     return CCU_SUCCESS;
 }
 
-CcuResult RunDirectRoot(BroadcastContext &ctx)
-{
-    ccu::LocalAddr source;
-    source.addr = ctx.buffer[ctx.arg->rankId];
-    source.addr += ctx.chunkOffset;
-    source.token = ctx.token[ctx.arg->rankId];
-
-    uint16_t completionMask = 0;
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        const uint32_t peerRank = ctx.arg->remoteRanks[i];
-        const uint16_t peerMask = static_cast<uint16_t>(1U << peerRank);
-        ccu::RemoteAddr destination;
-        destination.addr = ctx.buffer[peerRank];
-        destination.addr += ctx.chunkOffset;
-        destination.token = ctx.token[peerRank];
-        CCU_CHK_RET(ccu::Write(
-            ctx.arg->channels[i], destination, source, ctx.chunkBytes, ctx.event, peerMask));
-        completionMask = static_cast<uint16_t>(completionMask | peerMask);
-    }
-    if (completionMask != 0) {
-        CCU_CHK_RET(ccu::EventWait(ctx.event, completionMask));
-    }
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_DIRECT_DONE_ACK, false));
-    }
-    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-        CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_DIRECT_DONE_ACK, true));
-    }
-    return CCU_SUCCESS;
-}
-
-CcuResult RunDirectReceiver(BroadcastContext &ctx)
-{
-    CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_DIRECT_DONE_ACK, true));
-    CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_DIRECT_DONE_ACK, false));
-    return CCU_SUCCESS;
-}
-
 CcuResult RunPullSeedRoot(BroadcastContext &ctx)
 {
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
@@ -187,6 +149,40 @@ CcuResult RunPullAllGather(BroadcastContext &ctx)
 
     if (completionMask != 0) {
         CCU_CHK_RET(ccu::EventWait(ctx.event, completionMask));
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult WaitRootBufferInfo(BroadcastContext &ctx)
+{
+    constexpr uint32_t readyMask = MASK_BUFFER_READY | MASK_TOKEN_READY;
+    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+        CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
+            CCU_CHK_RET(ccu::NotifyWait(ctx.arg->channels[i], CKE_PRESYNC, readyMask));
+        }
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult ReadFullChunkFromRoot(BroadcastContext &ctx)
+{
+    const uint32_t myRank = ctx.arg->rankId;
+    const uint16_t completionMask = static_cast<uint16_t>(1U << myRank);
+    ccu::LocalAddr destination;
+    destination.addr = ctx.buffer[myRank];
+    destination.addr += ctx.chunkOffset;
+    destination.token = ctx.token[myRank];
+
+    for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+        CCU_IF(ctx.root == ctx.arg->remoteRanks[i]) {
+            ccu::RemoteAddr source;
+            source.addr = ctx.buffer[ctx.arg->remoteRanks[i]];
+            source.addr += ctx.chunkOffset;
+            source.token = ctx.token[ctx.arg->remoteRanks[i]];
+            CCU_CHK_RET(ccu::Read(ctx.arg->channels[i], destination, source,
+                ctx.chunkBytes, ctx.event, completionMask));
+            CCU_CHK_RET(ccu::EventWait(ctx.event, completionMask));
+        }
     }
     return CCU_SUCCESS;
 }
@@ -267,7 +263,7 @@ CcuResult PreSyncBufferInfo(BroadcastContext &ctx)
     return CCU_SUCCESS;
 }
 
-CcuResult CcuBroadcastDirectKernel(CcuKernelArg arg)
+CcuResult CcuBroadcastSmallReceiverPullKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
     BroadcastContext ctx;
@@ -275,18 +271,23 @@ CcuResult CcuBroadcastDirectKernel(CcuKernelArg arg)
     CCU_CHK_RET(LoadBroadcastArgs(ctx));
     CCU_CHK_RET(ccu::LoadArg(ctx.kernelPhase, 8));
 
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(DirectPhase::PRESYNC_PUBLISH)) {
-        CCU_CHK_RET(PublishBufferInfo(ctx));
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(DirectPhase::PRESYNC_WAIT)) {
-        CCU_CHK_RET(WaitBufferInfo(ctx));
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(DirectPhase::DATA)) {
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(SmallPullPhase::TRANSFER)) {
         CCU_IF(ctx.root == kernelArg->rankId) {
-            CCU_CHK_RET(RunDirectRoot(ctx));
+            CCU_CHK_RET(PublishBufferInfo(ctx));
+            CCU_CHK_RET(RunPullReadDoneRoot(ctx));
         }
         CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(RunDirectReceiver(ctx));
+            CCU_CHK_RET(WaitRootBufferInfo(ctx));
+            CCU_CHK_RET(ReadFullChunkFromRoot(ctx));
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_READ_DONE, false));
+        }
+    }
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(SmallPullPhase::GLOBAL_DONE)) {
+        CCU_IF(ctx.root == kernelArg->rankId) {
+            CCU_CHK_RET(RunPullGlobalDoneRoot(ctx));
+        }
+        CCU_IF(ctx.root != kernelArg->rankId) {
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_GLOBAL_DONE, true));
         }
     }
     return CCU_SUCCESS;

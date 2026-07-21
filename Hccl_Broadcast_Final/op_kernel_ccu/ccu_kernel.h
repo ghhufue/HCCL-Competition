@@ -34,7 +34,6 @@ enum BroadcastNotifyMask : uint32_t {
     NOTIFY_PHASE2_START = 1U << 1,
     NOTIFY_READ_DONE = 1U << 2,
     NOTIFY_GLOBAL_DONE = 1U << 3,
-    NOTIFY_DIRECT_DONE_ACK = 1U << 4,
 };
 
 struct BroadcastContext {
@@ -57,7 +56,7 @@ CcuResult LoadBroadcastArgs(BroadcastContext &ctx);
 CcuResult PublishBufferInfo(BroadcastContext &ctx);
 CcuResult WaitBufferInfo(BroadcastContext &ctx);
 CcuResult PreSyncBufferInfo(BroadcastContext &ctx);
-CcuResult CcuBroadcastDirectKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastSmallReceiverPullKernel(CcuKernelArg arg);
 CcuResult CcuBroadcastPullScatterAllGatherKernel(CcuKernelArg arg);
 
 } // namespace ops_hccl
