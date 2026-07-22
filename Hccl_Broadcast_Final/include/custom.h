@@ -22,11 +22,13 @@
 #include "binary_stream.h"
 #include "common.h"
 
-constexpr uint32_t RESOURCE_LAYOUT_VERSION = 9;
+constexpr uint32_t RESOURCE_LAYOUT_VERSION = 14;
 constexpr uint32_t BROADCAST_CCU_DIE_NUM = 2;
 constexpr uint32_t BROADCAST_READY_RING_SLOTS = 8;
+constexpr uint32_t BROADCAST_SEGMENT_PIPELINE_DEPTH = 2;
 constexpr uint32_t SMALL_PULL_PHASE_COUNT = 2;
 constexpr uint32_t OWNER_WRITE_PHASE_COUNT = 4;
+constexpr uint64_t OWNER_SEGMENT_PULL_PHASE = OWNER_WRITE_PHASE_COUNT + 1;
 
 namespace ops_hccl {
 
@@ -136,9 +138,11 @@ struct BroadcastKernelArg : public CcuKernelArgBase {
     uint32_t dieId;
     uint32_t seedDie;
     uint32_t activeDieMask;
+    uint32_t pushGroup;
     uint32_t pushWindowDepth;
     uint32_t enablePushBatchMerge;
     uint32_t remoteRanks[MAX_RANK_SIZE];
+    uint32_t peerGroups[MAX_RANK_SIZE];
 };
 
 enum class KernelKind : uint32_t {
@@ -184,6 +188,7 @@ struct AlgResourceCtx {
     uint32_t rankSize = 0;
     uint32_t rootRank = 0;
     uint32_t activeDieMask = 0;
+    uint32_t group1DieMask = 0;
     uint32_t pushWindowDepth = 2;
     uint32_t enablePushBatchMerge = 0;
     uint32_t peerDieByRank[MAX_RANK_SIZE]{};
@@ -191,16 +196,20 @@ struct AlgResourceCtx {
     CcuKernelHandle smallPullKernels[BROADCAST_CCU_DIE_NUM]{};
     CcuKernelHandle ownerWriteKernels[BROADCAST_CCU_DIE_NUM]{};
     CcuKernelHandle seedKernels[BROADCAST_CCU_DIE_NUM]{};
+    CcuKernelHandle segmentPushKernels[BROADCAST_CCU_DIE_NUM]{};
     ThreadHandle pushThreads[BROADCAST_CCU_DIE_NUM]{};
+    ThreadHandle pushGroup1Threads[BROADCAST_CCU_DIE_NUM]{};
     uint32_t pushThreadCount = 0;
 
     static constexpr uint64_t SerializedSize()
     {
         return sizeof(version) + sizeof(rankSize) + sizeof(rootRank) + sizeof(activeDieMask) +
+            sizeof(group1DieMask) +
             sizeof(pushWindowDepth) + sizeof(enablePushBatchMerge) + sizeof(peerDieByRank) +
             sizeof(localBuffer) +
             sizeof(smallPullKernels) + sizeof(ownerWriteKernels) + sizeof(seedKernels) +
-            sizeof(pushThreads) + sizeof(pushThreadCount);
+            sizeof(segmentPushKernels) +
+            sizeof(pushThreads) + sizeof(pushGroup1Threads) + sizeof(pushThreadCount);
     }
 
     std::vector<char> Serialize() const
@@ -210,6 +219,7 @@ struct AlgResourceCtx {
         binaryStream << rankSize;
         binaryStream << rootRank;
         binaryStream << activeDieMask;
+        binaryStream << group1DieMask;
         binaryStream << pushWindowDepth;
         binaryStream << enablePushBatchMerge;
         for (uint32_t rank = 0; rank < MAX_RANK_SIZE; ++rank) {
@@ -220,7 +230,9 @@ struct AlgResourceCtx {
             binaryStream << smallPullKernels[dieId];
             binaryStream << ownerWriteKernels[dieId];
             binaryStream << seedKernels[dieId];
+            binaryStream << segmentPushKernels[dieId];
             binaryStream << pushThreads[dieId];
+            binaryStream << pushGroup1Threads[dieId];
         }
         binaryStream << pushThreadCount;
         std::vector<char> result;
@@ -235,6 +247,7 @@ struct AlgResourceCtx {
         binaryStream >> rankSize;
         binaryStream >> rootRank;
         binaryStream >> activeDieMask;
+        binaryStream >> group1DieMask;
         binaryStream >> pushWindowDepth;
         binaryStream >> enablePushBatchMerge;
         for (uint32_t rank = 0; rank < MAX_RANK_SIZE; ++rank) {
@@ -245,7 +258,9 @@ struct AlgResourceCtx {
             binaryStream >> smallPullKernels[dieId];
             binaryStream >> ownerWriteKernels[dieId];
             binaryStream >> seedKernels[dieId];
+            binaryStream >> segmentPushKernels[dieId];
             binaryStream >> pushThreads[dieId];
+            binaryStream >> pushGroup1Threads[dieId];
         }
         binaryStream >> pushThreadCount;
     }

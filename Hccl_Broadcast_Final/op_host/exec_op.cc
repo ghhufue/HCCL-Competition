@@ -29,6 +29,9 @@ constexpr uint64_t DEFAULT_MAX_PUSH_BATCH_BYTES = 8ULL * 1024ULL * 1024ULL;
 constexpr uint32_t DEFAULT_PUSH_WINDOW_DEPTH = 2;
 constexpr uint64_t MAX_LOOP_ITERATIONS = 8191;
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
+constexpr uint32_t SEGMENT_TILES = 4;
+constexpr uint32_t SEGMENT_READY_NOTIFY_BASE = 1;
+constexpr uint32_t SEGMENT_DONE_NOTIFY_BASE = 1;
 
 HcclResult ParseBoolEnv(const char *name, bool defaultValue, bool &value)
 {
@@ -80,6 +83,10 @@ HcclResult LoadOwnerWriteConfigImpl(OwnerWriteConfig &config)
         HCCL_ERROR("[LoadOwnerWriteConfig] HCCL_BROADCAST_PUSH_WINDOW_DEPTH must be 1, 2, or 4; got %llu",
             static_cast<unsigned long long>(pushWindowDepth)), HCCL_E_PARA);
     config.pushWindowDepth = static_cast<uint32_t>(pushWindowDepth);
+    if (config.pushWindowDepth == 4) {
+        HCCL_INFO("[LoadOwnerWriteConfig] requested pushWindowDepth=4; effective CCU depth=2 "
+                  "because depth=4 exceeds the available continuous-XN resource budget");
+    }
     CHK_PRT_RET(config.tileSizeBytes % FP32_ALIGNMENT != 0 || config.tileSizeBytes > MAX_DATA_SIZE,
         HCCL_ERROR("[LoadOwnerWriteConfig] invalid tileSizeBytes=%llu",
             static_cast<unsigned long long>(config.tileSizeBytes)), HCCL_E_PARA);
@@ -157,6 +164,36 @@ HcclResult StartPushThreads(
     return HCCL_SUCCESS;
 }
 
+HcclResult StartOwnerPushThreads(const OpParam &param, const AlgResourceCtx &resCtx)
+{
+    const uint32_t expected = ActiveDieCount(resCtx.activeDieMask) + ActiveDieCount(resCtx.group1DieMask);
+    CHK_PRT_RET(expected == 0 || expected != resCtx.pushThreadCount ||
+            (resCtx.group1DieMask & ~resCtx.activeDieMask) != 0,
+        HCCL_ERROR("[StartOwnerPushThreads] invalid activeDieMask=%u group1DieMask=%u pushThreadCount=%u",
+            resCtx.activeDieMask, resCtx.group1DieMask, resCtx.pushThreadCount), HCCL_E_INTERNAL);
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyRecordOnThread(
+                param.cpuThread, resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX));
+        }
+        if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyRecordOnThread(
+                param.cpuThread, resCtx.pushGroup1Threads[dieId], THREAD_NOTIFY_INDEX));
+        }
+    }
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyWaitOnThread(
+                resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
+        }
+        if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyWaitOnThread(
+                resCtx.pushGroup1Threads[dieId], THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
+        }
+    }
+    return HCCL_SUCCESS;
+}
+
 HcclResult LaunchKernel(ThreadHandle thread, const OpParam &param, CcuKernelHandle kernel,
     uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk, uint64_t phase, bool ownerWriteArgs)
 {
@@ -201,6 +238,44 @@ HcclResult JoinPushThreads(
         CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread, THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
     }
     return HCCL_SUCCESS;
+}
+
+HcclResult JoinOwnerPushThreads(const OpParam &param, const AlgResourceCtx &resCtx)
+{
+    const uint32_t expected = ActiveDieCount(resCtx.activeDieMask) + ActiveDieCount(resCtx.group1DieMask);
+    CHK_PRT_RET(expected == 0 || expected != resCtx.pushThreadCount,
+        HCCL_ERROR("[JoinOwnerPushThreads] invalid pushThreadCount=%u expected=%u",
+            resCtx.pushThreadCount, expected), HCCL_E_INTERNAL);
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyRecordOnThread(
+                resCtx.pushThreads[dieId], param.cpuThread, THREAD_NOTIFY_INDEX));
+        }
+        if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyRecordOnThread(
+                resCtx.pushGroup1Threads[dieId], param.cpuThread, THREAD_NOTIFY_INDEX));
+        }
+    }
+    for (uint32_t i = 0; i < expected; ++i) {
+        CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread, THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult LaunchOwnerPushGroups(const OpParam &param, const AlgResourceCtx &resCtx,
+    uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk, uint64_t phase)
+{
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+            CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, resCtx.ownerWriteKernels[dieId],
+                baseAddr, token, chunk, phase, true));
+        }
+        if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
+            CHK_RET(LaunchKernel(resCtx.pushGroup1Threads[dieId], param, resCtx.segmentPushKernels[dieId],
+                baseAddr, token, chunk, phase, true));
+        }
+    }
+    return JoinOwnerPushThreads(param, resCtx);
 }
 
 HcclResult LaunchPhaseOnPushThreads(const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask,
@@ -249,6 +324,135 @@ uint32_t GetSeedDie(const OpParam &param, const AlgResourceCtx &resCtx)
     return BROADCAST_CCU_DIE_NUM;
 }
 
+uint32_t SegmentReadyNotifyIndex(uint32_t slot)
+{
+    return SEGMENT_READY_NOTIFY_BASE + slot;
+}
+
+uint32_t SegmentDoneNotifyIndex(uint32_t slot, uint32_t dieId, uint32_t pushGroup)
+{
+    return SEGMENT_DONE_NOTIFY_BASE + slot * BROADCAST_CCU_DIE_NUM * 2 + dieId * 2 + pushGroup;
+}
+
+HcclResult BuildOwnerSegment(const ChunkDesc &chunk, uint64_t relativeOffsetBytes,
+    uint64_t segmentBytes, uint32_t slot, ChunkDesc &segment)
+{
+    CHK_PRT_RET(relativeOffsetBytes > chunk.owner.bytes ||
+            segmentBytes > chunk.owner.bytes - relativeOffsetBytes ||
+            slot >= BROADCAST_SEGMENT_PIPELINE_DEPTH,
+        HCCL_ERROR("[BuildOwnerSegment] invalid offset=%llu bytes=%llu ownerBytes=%llu slot=%u",
+            static_cast<unsigned long long>(relativeOffsetBytes),
+            static_cast<unsigned long long>(segmentBytes),
+            static_cast<unsigned long long>(chunk.owner.bytes), slot), HCCL_E_PARA);
+    segment = chunk;
+    segment.owner.offset = chunk.owner.offset + relativeOffsetBytes;
+    segment.owner.bytes = segmentBytes;
+    segment.owner.tileCount = static_cast<uint32_t>(DivideRoundUp(segmentBytes, chunk.tileSizeBytes));
+    segment.seedFullTileCount = segmentBytes / chunk.tileSizeBytes;
+    segment.seedTailBytes = segmentBytes % chunk.tileSizeBytes;
+    segment.readyRingIndex = slot;
+    segment.push = BuildPushBatchPlan(segmentBytes, chunk.tileSizeBytes,
+        chunk.enablePushBatchMerge, chunk.maxPushBatchBytes);
+    return HCCL_SUCCESS;
+}
+
+HcclResult SubmitOwnerSegment(const OpParam &param, const AlgResourceCtx &resCtx,
+    uint32_t seedDie, uint64_t baseAddr, uint64_t token, const ChunkDesc &segment)
+{
+    const CcuKernelHandle pullKernel = resCtx.ownerWriteKernels[seedDie];
+    CHK_PRT_RET(pullKernel == 0,
+        HCCL_ERROR("[SubmitOwnerSegment] missing segment Pull kernel on die=%u", seedDie),
+        HCCL_E_INTERNAL);
+    CHK_RET(LaunchKernel(param.cpuThread, param, pullKernel, baseAddr, token,
+        segment, OWNER_SEGMENT_PULL_PHASE, true));
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) == 0) {
+            continue;
+        }
+        const uint32_t readyNotifyIndex = SegmentReadyNotifyIndex(segment.readyRingIndex);
+        CHK_RET(HcommThreadNotifyRecordOnThread(
+            param.cpuThread, resCtx.pushThreads[dieId], readyNotifyIndex));
+        CHK_RET(HcommThreadNotifyWaitOnThread(
+            resCtx.pushThreads[dieId], readyNotifyIndex, CUSTOM_TIMEOUT));
+        const CcuKernelHandle pushKernel = resCtx.ownerWriteKernels[dieId];
+        CHK_PRT_RET(pushKernel == 0,
+            HCCL_ERROR("[SubmitOwnerSegment] missing group-0 Push kernel for die=%u", dieId),
+            HCCL_E_INTERNAL);
+        CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, pushKernel,
+            baseAddr, token, segment, OWNER_WRITE_PHASE_COUNT, true));
+        CHK_RET(HcommThreadNotifyRecordOnThread(resCtx.pushThreads[dieId], param.cpuThread,
+            SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 0)));
+        if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyRecordOnThread(
+                param.cpuThread, resCtx.pushGroup1Threads[dieId], readyNotifyIndex));
+            CHK_RET(HcommThreadNotifyWaitOnThread(
+                resCtx.pushGroup1Threads[dieId], readyNotifyIndex, CUSTOM_TIMEOUT));
+            CHK_PRT_RET(resCtx.segmentPushKernels[dieId] == 0,
+                HCCL_ERROR("[SubmitOwnerSegment] missing group-1 Push kernel for die=%u", dieId),
+                HCCL_E_INTERNAL);
+            CHK_RET(LaunchKernel(resCtx.pushGroup1Threads[dieId], param, resCtx.segmentPushKernels[dieId],
+                baseAddr, token, segment, OWNER_WRITE_PHASE_COUNT, true));
+            CHK_RET(HcommThreadNotifyRecordOnThread(resCtx.pushGroup1Threads[dieId], param.cpuThread,
+                SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 1)));
+        }
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult DrainOwnerSegment(const OpParam &param, const AlgResourceCtx &resCtx,
+    const ChunkDesc &segment)
+{
+    // A Host Ready slot is reusable only after every active Push Die records
+    // completion for this exact slot generation.
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) == 0) {
+            continue;
+        }
+        CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread,
+            SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 0), CUSTOM_TIMEOUT));
+        if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread,
+                SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 1), CUSTOM_TIMEOUT));
+        }
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult LaunchSegmentedOwnerPipeline(const OpParam &param, const AlgResourceCtx &resCtx,
+    uint32_t seedDie, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk)
+{
+    CHK_PRT_RET(chunk.tileSizeBytes > std::numeric_limits<uint64_t>::max() / SEGMENT_TILES,
+        HCCL_ERROR("[LaunchSegmentedOwnerPipeline] segment size overflows"), HCCL_E_PARA);
+    const uint64_t maxSegmentBytes = chunk.tileSizeBytes * SEGMENT_TILES;
+    ChunkDesc inFlight[BROADCAST_SEGMENT_PIPELINE_DEPTH];
+    bool slotInFlight[BROADCAST_SEGMENT_PIPELINE_DEPTH]{};
+    uint64_t relativeOffsetBytes = 0;
+    uint64_t generation = 0;
+    while (relativeOffsetBytes < chunk.owner.bytes) {
+        const uint32_t slot = static_cast<uint32_t>(generation % BROADCAST_SEGMENT_PIPELINE_DEPTH);
+        if (slotInFlight[slot]) {
+            CHK_RET(DrainOwnerSegment(param, resCtx, inFlight[slot]));
+        }
+        const uint64_t segmentBytes = std::min(maxSegmentBytes, chunk.owner.bytes - relativeOffsetBytes);
+        CHK_RET(BuildOwnerSegment(chunk, relativeOffsetBytes, segmentBytes, slot, inFlight[slot]));
+        HCCL_DEBUG("[OwnerSegmentSubmit] rank=%u root=%u seedDie=%u generation=%llu slot=%u "
+                   "ownerOffset=%llu segmentBytes=%llu tiles=%u",
+            param.myRank, param.root, seedDie, static_cast<unsigned long long>(generation), slot,
+            static_cast<unsigned long long>(inFlight[slot].owner.offset),
+            static_cast<unsigned long long>(segmentBytes), inFlight[slot].owner.tileCount);
+        CHK_RET(SubmitOwnerSegment(param, resCtx, seedDie, baseAddr, token, inFlight[slot]));
+        slotInFlight[slot] = true;
+        relativeOffsetBytes += segmentBytes;
+        ++generation;
+    }
+    for (uint32_t slot = 0; slot < BROADCAST_SEGMENT_PIPELINE_DEPTH; ++slot) {
+        if (slotInFlight[slot]) {
+            CHK_RET(DrainOwnerSegment(param, resCtx, inFlight[slot]));
+        }
+    }
+    return JoinOwnerPushThreads(param, resCtx);
+}
+
 } // namespace
 
 HcclResult LoadOwnerWriteConfig(OwnerWriteConfig &config)
@@ -277,19 +481,6 @@ HcclResult BuildExecutionPlan(
         chunk.maxPushBatchBytes = config.maxPushBatchBytes;
         chunk.pushWindowDepth = config.pushWindowDepth;
         chunk.owner = GetOwnerBlock(totalBytes, rankSize, rankId, config.tileSizeBytes);
-        // The single-Die 4-rank topology forms a checker dependency cycle when
-        // Seed reuses a Ready bit and waits for Push credit. Keep its complete
-        // owner block within one Ready ring; larger topologies retain the tuned
-        // Tile size and cross-batch credit pipeline.
-        if (rankSize == 4 && chunk.owner.tileCount > BROADCAST_READY_RING_SLOTS) {
-            const uint64_t minimumTileBytes = DivideRoundUp(
-                chunk.owner.bytes, BROADCAST_READY_RING_SLOTS);
-            const uint64_t alignedTileBytes = DivideRoundUp(
-                minimumTileBytes, config.tileSizeBytes) * config.tileSizeBytes;
-            chunk.tileSizeBytes = std::max(config.tileSizeBytes, alignedTileBytes);
-            chunk.maxPushBatchBytes = std::max(config.maxPushBatchBytes, chunk.tileSizeBytes);
-            chunk.owner = GetOwnerBlock(totalBytes, rankSize, rankId, chunk.tileSizeBytes);
-        }
         const uint64_t fullTileCount = chunk.owner.bytes / chunk.tileSizeBytes;
         CHK_PRT_RET(fullTileCount > MAX_LOOP_ITERATIONS,
             HCCL_ERROR("[BuildExecutionPlan] owner block needs too many Tile iterations=%llu",
@@ -322,41 +513,32 @@ HcclResult LaunchSmallReceiverPullChunk(
 HcclResult LaunchContiguousOwnerWriteChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk)
 {
-    CHK_RET(StartPushThreads(param, resCtx, resCtx.activeDieMask));
-    CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, resCtx.activeDieMask, resCtx.ownerWriteKernels,
-        baseAddr, token, chunk, static_cast<uint64_t>(OwnerWritePhase::PRESYNC_PUBLISH), true));
-    CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, resCtx.activeDieMask, resCtx.ownerWriteKernels,
-        baseAddr, token, chunk, static_cast<uint64_t>(OwnerWritePhase::PRESYNC_WAIT), true));
+    CHK_RET(StartOwnerPushThreads(param, resCtx));
+    CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
+        static_cast<uint64_t>(OwnerWritePhase::PRESYNC_PUBLISH)));
+    CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
+        static_cast<uint64_t>(OwnerWritePhase::PRESYNC_WAIT)));
+
+    if (param.myRank == param.root) {
+        // The root owner's block is already in the user buffer. Launch every
+        // active Die together and bypass both the Seed read and Ready ring.
+        CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk, OWNER_WRITE_PHASE_COUNT));
+        CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
+            static_cast<uint64_t>(OwnerWritePhase::OWNER_DONE)));
+        CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
+            static_cast<uint64_t>(OwnerWritePhase::GLOBAL_DONE)));
+        return HCCL_SUCCESS;
+    }
 
     const uint32_t seedDie = GetSeedDie(param, resCtx);
-    CHK_PRT_RET(seedDie >= BROADCAST_CCU_DIE_NUM || resCtx.seedKernels[seedDie] == 0,
+    CHK_PRT_RET(seedDie >= BROADCAST_CCU_DIE_NUM || resCtx.ownerWriteKernels[seedDie] == 0,
         HCCL_ERROR("[LaunchContiguousOwnerWriteChunk] invalid seed die=%u", seedDie), HCCL_E_INTERNAL);
-    CHK_RET(LaunchKernel(param.cpuThread, param, resCtx.seedKernels[seedDie], baseAddr, token,
-        chunk, static_cast<uint64_t>(OwnerSeedPhase::RUN), true));
-    CHK_RET(LaunchKernel(resCtx.pushThreads[seedDie], param, resCtx.ownerWriteKernels[seedDie],
-        baseAddr, token, chunk, OWNER_WRITE_PHASE_COUNT, true));
-    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) == 0 || dieId == seedDie) {
-            continue;
-        }
-        // CcuLocalNotify is Die-local on the checker/runtime. Keep the Seed
-        // Die on the Tile-ready pipeline and release the other Die once the
-        // complete owner block has been pulled into local memory.
-        CHK_RET(HcommThreadNotifyRecordOnThread(
-            param.cpuThread, resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX));
-        CHK_RET(HcommThreadNotifyWaitOnThread(
-            resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
-        CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, resCtx.ownerWriteKernels[dieId],
-            baseAddr, token, chunk, OWNER_WRITE_PHASE_COUNT, true));
-    }
-    CHK_RET(JoinPushThreads(param, resCtx, resCtx.activeDieMask));
-    CHK_RET(LaunchKernel(param.cpuThread, param, resCtx.seedKernels[seedDie], baseAddr, token,
-        chunk, static_cast<uint64_t>(OwnerSeedPhase::FINAL_CREDIT_DRAIN), true));
+    CHK_RET(LaunchSegmentedOwnerPipeline(param, resCtx, seedDie, baseAddr, token, chunk));
 
-    CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, resCtx.activeDieMask, resCtx.ownerWriteKernels,
-        baseAddr, token, chunk, static_cast<uint64_t>(OwnerWritePhase::OWNER_DONE), true));
-    CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, resCtx.activeDieMask, resCtx.ownerWriteKernels,
-        baseAddr, token, chunk, static_cast<uint64_t>(OwnerWritePhase::GLOBAL_DONE), true));
+    CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
+        static_cast<uint64_t>(OwnerWritePhase::OWNER_DONE)));
+    CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
+        static_cast<uint64_t>(OwnerWritePhase::GLOBAL_DONE)));
     return HCCL_SUCCESS;
 }
 
@@ -380,10 +562,12 @@ HcclResult ExecOp(const OpParam &param, aclrtStream stream)
     CHK_PRT_RET(resCtx.rootRank != param.root,
         HCCL_ERROR("[ExecOp] context root=%u does not match call root=%u",
             resCtx.rootRank, param.root), HCCL_E_INTERNAL);
-    const uint32_t activeCount = ActiveDieCount(resCtx.activeDieMask);
-    CHK_PRT_RET(activeCount == 0 || activeCount != resCtx.pushThreadCount,
-        HCCL_ERROR("[ExecOp] activeDieMask=%u does not match pushThreadCount=%u",
-            resCtx.activeDieMask, resCtx.pushThreadCount), HCCL_E_INTERNAL);
+    const uint32_t expectedThreadCount =
+        ActiveDieCount(resCtx.activeDieMask) + ActiveDieCount(resCtx.group1DieMask);
+    CHK_PRT_RET(expectedThreadCount == 0 || expectedThreadCount != resCtx.pushThreadCount ||
+            (resCtx.group1DieMask & ~resCtx.activeDieMask) != 0,
+        HCCL_ERROR("[ExecOp] activeDieMask=%u group1DieMask=%u does not match pushThreadCount=%u",
+            resCtx.activeDieMask, resCtx.group1DieMask, resCtx.pushThreadCount), HCCL_E_INTERNAL);
 
     const auto sizeIt = SIZE_TABLE.find(param.dataType);
     CHK_PRT_RET(sizeIt == SIZE_TABLE.end(), HCCL_ERROR("[ExecOp] unsupported data type"), HCCL_E_PARA);

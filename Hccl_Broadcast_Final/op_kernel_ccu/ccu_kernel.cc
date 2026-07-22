@@ -80,27 +80,27 @@ const char *CreditTag(const BroadcastContext &ctx)
     return ctx.arg->dieId == 0 ? SEED_CREDIT_DIE0 : SEED_CREDIT_DIE1;
 }
 
-CcuResult RecordSeedReady(const BroadcastContext &ctx, uint16_t mask)
+CcuResult RecordSeedReady(BroadcastContext &ctx, uint16_t mask)
 {
     return ccu::EventRecord(ReadyTag(ctx), mask);
 }
 
-CcuResult WaitSeedCredits(const BroadcastContext &ctx, uint16_t mask)
+CcuResult WaitSeedCredits(BroadcastContext &ctx, uint16_t mask)
 {
     return ccu::EventWait(CreditTag(ctx), mask);
 }
 
-CcuResult WaitSeedReady(const BroadcastContext &ctx, uint16_t mask)
+CcuResult WaitSeedReady(BroadcastContext &ctx, uint16_t mask)
 {
     return ccu::EventWait(ReadyTag(ctx), mask);
 }
 
-CcuResult RecordSeedCredit(const BroadcastContext &ctx, uint16_t mask)
+CcuResult RecordSeedCredit(BroadcastContext &ctx, uint16_t mask)
 {
     return ccu::EventRecord(CreditTag(ctx), mask);
 }
 
-CcuResult RecordSeedReadySlot(const BroadcastContext &ctx, ccu::Variable &slot)
+CcuResult RecordSeedReadySlot(BroadcastContext &ctx, ccu::Variable &slot)
 {
     for (uint32_t i = 0; i < READY_RING_SLOTS; ++i) {
         CCU_IF(slot == i) {
@@ -110,7 +110,7 @@ CcuResult RecordSeedReadySlot(const BroadcastContext &ctx, ccu::Variable &slot)
     return CCU_SUCCESS;
 }
 
-CcuResult WaitSeedReadySlot(const BroadcastContext &ctx, ccu::Variable &slot)
+CcuResult WaitSeedReadySlot(BroadcastContext &ctx, ccu::Variable &slot)
 {
     for (uint32_t i = 0; i < READY_RING_SLOTS; ++i) {
         CCU_IF(slot == i) {
@@ -196,30 +196,35 @@ CcuResult RunSeed(BroadcastContext &ctx, ccu::Event &event)
     return CCU_SUCCESS;
 }
 
-bool IsPushPeer(const BroadcastContext &ctx, uint32_t peerRank)
+template <uint32_t PushGroup>
+bool IsPushChannel(const BroadcastContext &ctx, uint32_t channelIndex)
 {
-    return ctx.arg->rankId == ctx.arg->rootRank || peerRank != ctx.arg->rootRank;
+    const uint32_t peerRank = ctx.arg->remoteRanks[channelIndex];
+    return (ctx.arg->rankId == ctx.arg->rootRank || peerRank != ctx.arg->rootRank) &&
+        ctx.arg->peerGroups[channelIndex] == PushGroup;
 }
 
+template <uint32_t PushGroup>
 uint16_t PushCompletionMask(const BroadcastContext &ctx)
 {
     uint16_t mask = 0;
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
         const uint32_t peerRank = ctx.arg->remoteRanks[i];
-        if (IsPushPeer(ctx, peerRank)) {
+        if (IsPushChannel<PushGroup>(ctx, i)) {
             mask = static_cast<uint16_t>(mask | (1U << peerRank));
         }
     }
     return mask;
 }
 
+template <uint32_t PushGroup>
 CcuResult SubmitOwnerWritesNoWait(BroadcastContext &ctx, ccu::Variable &offset,
     ccu::Variable &bytes, ccu::Event &event)
 {
     ccu::LocalAddr source = LocalAt(ctx, offset);
     for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
         const uint32_t peerRank = ctx.arg->remoteRanks[i];
-        if (!IsPushPeer(ctx, peerRank)) {
+        if (!IsPushChannel<PushGroup>(ctx, i)) {
             continue;
         }
         ccu::RemoteAddr destination = RemoteAt(ctx, peerRank, offset);
@@ -229,16 +234,17 @@ CcuResult SubmitOwnerWritesNoWait(BroadcastContext &ctx, ccu::Variable &offset,
     return CCU_SUCCESS;
 }
 
+template <uint32_t PushGroup>
 CcuResult WaitOwnerWriteBatch(BroadcastContext &ctx, ccu::Event &event)
 {
-    const uint16_t mask = PushCompletionMask(ctx);
+    const uint16_t mask = PushCompletionMask<PushGroup>(ctx);
     if (mask != 0) {
         CCU_CHK_RET(ccu::EventWait(event, mask));
     }
     return CCU_SUCCESS;
 }
 
-template <uint32_t Depth, bool UseReady>
+template <uint32_t Depth, bool UseReady, uint32_t PushGroup>
 CcuResult PushFullReadyGroup(BroadcastContext &ctx, ccu::Variable &offset, ccu::Event *events)
 {
     for (uint32_t windowStart = 0; windowStart < READY_RING_SLOTS; windowStart += Depth) {
@@ -247,7 +253,7 @@ CcuResult PushFullReadyGroup(BroadcastContext &ctx, ccu::Variable &offset, ccu::
             if (UseReady) {
                 CCU_CHK_RET(WaitSeedReady(ctx, static_cast<uint16_t>(1U << readySlot)));
             }
-            CCU_CHK_RET(SubmitOwnerWritesNoWait(ctx, offset, ctx.tileSizeBytes, events[eventSlot]));
+            CCU_CHK_RET(SubmitOwnerWritesNoWait<PushGroup>(ctx, offset, ctx.tileSizeBytes, events[eventSlot]));
             offset += ctx.tileSizeBytes;
         }
         if (UseReady && windowStart + Depth == READY_RING_SLOTS) {
@@ -255,50 +261,98 @@ CcuResult PushFullReadyGroup(BroadcastContext &ctx, ccu::Variable &offset, ccu::
             CCU_CHK_RET(RecordSeedCredit(ctx, READY_RING_MASK));
         }
         for (uint32_t eventSlot = 0; eventSlot < Depth; ++eventSlot) {
-            CCU_CHK_RET(WaitOwnerWriteBatch(ctx, events[eventSlot]));
+            CCU_CHK_RET(WaitOwnerWriteBatch<PushGroup>(ctx, events[eventSlot]));
         }
     }
     return CCU_SUCCESS;
 }
 
-template <uint32_t Depth>
+template <uint32_t Depth, uint32_t PushGroup>
 CcuResult SubmitDynamicEventSlot(BroadcastContext &ctx, ccu::Variable &eventSlot,
     ccu::Variable &offset, ccu::Variable &bytes, ccu::Event *events)
 {
     for (uint32_t i = 0; i < Depth; ++i) {
         CCU_IF(eventSlot == i) {
-            CCU_CHK_RET(SubmitOwnerWritesNoWait(ctx, offset, bytes, events[i]));
+            CCU_CHK_RET(SubmitOwnerWritesNoWait<PushGroup>(ctx, offset, bytes, events[i]));
         }
     }
     return CCU_SUCCESS;
 }
 
-template <uint32_t Depth>
+template <uint32_t Depth, uint32_t PushGroup>
+CcuResult WaitDynamicEventSlot(BroadcastContext &ctx, ccu::Variable &eventSlot, ccu::Event *events)
+{
+    for (uint32_t i = 0; i < Depth; ++i) {
+        CCU_IF(eventSlot == i) {
+            CCU_CHK_RET(WaitOwnerWriteBatch<PushGroup>(ctx, events[i]));
+        }
+    }
+    return CCU_SUCCESS;
+}
+
+template <uint32_t Depth, uint32_t PushGroup>
+CcuResult SubmitRollingEventSlot(BroadcastContext &ctx, ccu::Variable &eventSlot,
+    ccu::Variable &inFlightCount, ccu::Variable &offset, ccu::Variable &bytes,
+    ccu::Variable &one, ccu::Event *events)
+{
+    // Once the window is full, only the event occupying the slot selected for
+    // reuse is waited. The replacement batch is submitted immediately.
+    CCU_IF(inFlightCount == Depth) {
+        CCU_CHK_RET((WaitDynamicEventSlot<Depth, PushGroup>(ctx, eventSlot, events)));
+    }
+    CCU_IF(inFlightCount != Depth) {
+        inFlightCount += one;
+    }
+    CCU_CHK_RET((SubmitDynamicEventSlot<Depth, PushGroup>(ctx, eventSlot, offset, bytes, events)));
+    eventSlot += one;
+    CCU_IF(eventSlot == Depth) {
+        eventSlot = 0;
+    }
+    return CCU_SUCCESS;
+}
+
+template <uint32_t Depth, uint32_t PushGroup>
+CcuResult DrainRollingWindow(BroadcastContext &ctx, ccu::Variable &eventSlot,
+    ccu::Variable &inFlightCount, ccu::Event *events)
+{
+    for (uint32_t used = 1; used <= Depth; ++used) {
+        CCU_IF(inFlightCount == used) {
+            for (uint32_t i = 0; i < used; ++i) {
+                CCU_CHK_RET(WaitOwnerWriteBatch<PushGroup>(ctx, events[i]));
+            }
+        }
+    }
+    eventSlot = 0;
+    inFlightCount = 0;
+    return CCU_SUCCESS;
+}
+
+template <uint32_t Depth, uint32_t PushGroup>
 CcuResult DrainFullDynamicWindow(BroadcastContext &ctx, ccu::Variable &eventSlot, ccu::Event *events)
 {
     CCU_IF(eventSlot == Depth) {
         for (uint32_t i = 0; i < Depth; ++i) {
-            CCU_CHK_RET(WaitOwnerWriteBatch(ctx, events[i]));
+            CCU_CHK_RET(WaitOwnerWriteBatch<PushGroup>(ctx, events[i]));
         }
         eventSlot = 0;
     }
     return CCU_SUCCESS;
 }
 
-template <uint32_t Depth>
+template <uint32_t Depth, uint32_t PushGroup>
 CcuResult DrainPartialDynamicWindow(BroadcastContext &ctx, ccu::Variable &eventSlot, ccu::Event *events)
 {
     for (uint32_t used = 1; used < Depth; ++used) {
         CCU_IF(eventSlot == used) {
             for (uint32_t i = 0; i < used; ++i) {
-                CCU_CHK_RET(WaitOwnerWriteBatch(ctx, events[i]));
+                CCU_CHK_RET(WaitOwnerWriteBatch<PushGroup>(ctx, events[i]));
             }
         }
     }
     return CCU_SUCCESS;
 }
 
-template <uint32_t Depth, bool UseReady>
+template <uint32_t Depth, bool UseReady, uint32_t PushGroup>
 CcuResult RunUnmergedPush(BroadcastContext &ctx, ccu::Event *events)
 {
     ccu::Variable offset;
@@ -307,10 +361,27 @@ CcuResult RunUnmergedPush(BroadcastContext &ctx, ccu::Event *events)
     negativeOne = UINT64_MAX;
     ccu::Variable one;
     one = 1;
+    ccu::Variable eventSlot;
+    eventSlot = 0;
+    ccu::Variable inFlightCount;
+    inFlightCount = 0;
     ccu::Variable groupCount;
     groupCount = ctx.seedFullGroupCount;
     CCU_WHILE(groupCount != 0) {
-        CCU_CHK_RET((PushFullReadyGroup<Depth, UseReady>(ctx, offset, events)));
+        for (uint32_t readySlot = 0; readySlot < READY_RING_SLOTS; ++readySlot) {
+            if (UseReady) {
+                CCU_CHK_RET(WaitSeedReady(ctx, static_cast<uint16_t>(1U << readySlot)));
+            }
+            CCU_CHK_RET((SubmitRollingEventSlot<Depth, PushGroup>(
+                ctx, eventSlot, inFlightCount, offset, ctx.tileSizeBytes, one, events)));
+            offset += ctx.tileSizeBytes;
+        }
+        if (UseReady) {
+            // Ready credit is separate from event-slot reuse: do not allow the
+            // Seed to rotate the ring until all reads of this generation end.
+            CCU_CHK_RET((DrainRollingWindow<Depth, PushGroup>(ctx, eventSlot, inFlightCount, events)));
+            CCU_CHK_RET(RecordSeedCredit(ctx, READY_RING_MASK));
+        }
         groupCount = groupCount + negativeOne;
     }
 
@@ -320,17 +391,14 @@ CcuResult RunUnmergedPush(BroadcastContext &ctx, ccu::Event *events)
     finalReadyCount = remaining;
     ccu::Variable readySlot;
     readySlot = 0;
-    ccu::Variable eventSlot;
-    eventSlot = 0;
     CCU_WHILE(remaining != 0) {
         if (UseReady) {
             CCU_CHK_RET(WaitSeedReadySlot(ctx, readySlot));
         }
-        CCU_CHK_RET(SubmitDynamicEventSlot<Depth>(ctx, eventSlot, offset, ctx.tileSizeBytes, events));
+        CCU_CHK_RET((SubmitRollingEventSlot<Depth, PushGroup>(
+            ctx, eventSlot, inFlightCount, offset, ctx.tileSizeBytes, one, events)));
         offset += ctx.tileSizeBytes;
         readySlot += one;
-        eventSlot += one;
-        CCU_CHK_RET(DrainFullDynamicWindow<Depth>(ctx, eventSlot, events));
         remaining = remaining + negativeOne;
     }
     CCU_IF(ctx.seedTailBytes != 0) {
@@ -338,16 +406,16 @@ CcuResult RunUnmergedPush(BroadcastContext &ctx, ccu::Event *events)
         if (UseReady) {
             CCU_CHK_RET(WaitSeedReadySlot(ctx, readySlot));
         }
-        CCU_CHK_RET(SubmitDynamicEventSlot<Depth>(ctx, eventSlot, offset, ctx.seedTailBytes, events));
-        eventSlot += one;
-        CCU_CHK_RET(DrainFullDynamicWindow<Depth>(ctx, eventSlot, events));
+        CCU_CHK_RET((SubmitRollingEventSlot<Depth, PushGroup>(
+            ctx, eventSlot, inFlightCount, offset, ctx.seedTailBytes, one, events)));
     }
     if (UseReady) {
         CCU_IF(finalReadyCount != 0) {
+            CCU_CHK_RET((DrainRollingWindow<Depth, PushGroup>(ctx, eventSlot, inFlightCount, events)));
             CCU_CHK_RET(RecordSeedCredit(ctx, READY_RING_MASK));
         }
     }
-    CCU_CHK_RET(DrainPartialDynamicWindow<Depth>(ctx, eventSlot, events));
+    CCU_CHK_RET((DrainRollingWindow<Depth, PushGroup>(ctx, eventSlot, inFlightCount, events)));
     return CCU_SUCCESS;
 }
 
@@ -375,7 +443,7 @@ CcuResult ConsumeReadyTiles(BroadcastContext &ctx, ccu::Variable &readySlot,
     return CCU_SUCCESS;
 }
 
-template <uint32_t Depth, bool UseReady>
+template <uint32_t Depth, bool UseReady, uint32_t PushGroup>
 CcuResult SubmitMergedBatch(BroadcastContext &ctx, ccu::Variable &readySlot, ccu::Variable &eventSlot,
     ccu::Variable &offset, ccu::Variable &bytes, ccu::Variable &readyTiles,
     ccu::Variable &one, ccu::Event *events)
@@ -383,14 +451,14 @@ CcuResult SubmitMergedBatch(BroadcastContext &ctx, ccu::Variable &readySlot, ccu
     if (UseReady) {
         CCU_CHK_RET(ConsumeReadyTiles(ctx, readySlot, readyTiles, one));
     }
-    CCU_CHK_RET(SubmitDynamicEventSlot<Depth>(ctx, eventSlot, offset, bytes, events));
+    CCU_CHK_RET((SubmitDynamicEventSlot<Depth, PushGroup>(ctx, eventSlot, offset, bytes, events)));
     offset += bytes;
     eventSlot += one;
-    CCU_CHK_RET(DrainFullDynamicWindow<Depth>(ctx, eventSlot, events));
+    CCU_CHK_RET((DrainFullDynamicWindow<Depth, PushGroup>(ctx, eventSlot, events)));
     return CCU_SUCCESS;
 }
 
-template <uint32_t Depth, bool UseReady>
+template <uint32_t Depth, bool UseReady, uint32_t PushGroup>
 CcuResult RunMergedPush(BroadcastContext &ctx, ccu::Event *events)
 {
     ccu::Variable offset;
@@ -402,7 +470,7 @@ CcuResult RunMergedPush(BroadcastContext &ctx, ccu::Event *events)
     ccu::Variable one;
     one = 1;
     CCU_IF(ctx.pushFirstBytes != 0) {
-        CCU_CHK_RET((SubmitMergedBatch<Depth, UseReady>(ctx, readySlot, eventSlot, offset,
+        CCU_CHK_RET((SubmitMergedBatch<Depth, UseReady, PushGroup>(ctx, readySlot, eventSlot, offset,
             ctx.pushFirstBytes, one, one, events)));
     }
 
@@ -411,12 +479,12 @@ CcuResult RunMergedPush(BroadcastContext &ctx, ccu::Event *events)
     ccu::Variable loopCount;
     loopCount = ctx.pushLoopCount;
     CCU_WHILE(loopCount != 0) {
-        CCU_CHK_RET((SubmitMergedBatch<Depth, UseReady>(ctx, readySlot, eventSlot, offset,
+        CCU_CHK_RET((SubmitMergedBatch<Depth, UseReady, PushGroup>(ctx, readySlot, eventSlot, offset,
             ctx.maxPushBatchBytes, ctx.pushMergeFactor, one, events)));
         loopCount = loopCount + negativeOne;
     }
     CCU_IF(ctx.pushTailBytes != 0) {
-        CCU_CHK_RET((SubmitMergedBatch<Depth, UseReady>(ctx, readySlot, eventSlot, offset,
+        CCU_CHK_RET((SubmitMergedBatch<Depth, UseReady, PushGroup>(ctx, readySlot, eventSlot, offset,
             ctx.pushTailBytes, ctx.pushTailReadyTiles, one, events)));
     }
     if (UseReady) {
@@ -424,30 +492,93 @@ CcuResult RunMergedPush(BroadcastContext &ctx, ccu::Event *events)
             CCU_CHK_RET(RecordSeedCredit(ctx, READY_RING_MASK));
         }
     }
-    CCU_CHK_RET(DrainPartialDynamicWindow<Depth>(ctx, eventSlot, events));
+    CCU_CHK_RET((DrainPartialDynamicWindow<Depth, PushGroup>(ctx, eventSlot, events)));
     return CCU_SUCCESS;
 }
 
-template <bool UseReady>
+template <bool UseReady, uint32_t PushGroup>
 CcuResult RunPush(BroadcastContext &ctx, ccu::Event *events)
 {
     if (ctx.arg->enablePushBatchMerge == 0) {
         if (ctx.arg->pushWindowDepth == 1) {
-            return RunUnmergedPush<1, UseReady>(ctx, events);
+            return RunUnmergedPush<1, UseReady, PushGroup>(ctx, events);
         } else if (ctx.arg->pushWindowDepth == 2) {
-            return RunUnmergedPush<2, UseReady>(ctx, events);
+            return RunUnmergedPush<2, UseReady, PushGroup>(ctx, events);
         } else {
-            return RunUnmergedPush<4, UseReady>(ctx, events);
+            return RunUnmergedPush<2, UseReady, PushGroup>(ctx, events);
         }
     } else {
         if (ctx.arg->pushWindowDepth == 1) {
-            return RunMergedPush<1, UseReady>(ctx, events);
+            return RunMergedPush<1, UseReady, PushGroup>(ctx, events);
         } else if (ctx.arg->pushWindowDepth == 2) {
-            return RunMergedPush<2, UseReady>(ctx, events);
+            return RunMergedPush<2, UseReady, PushGroup>(ctx, events);
         } else {
-            return RunMergedPush<4, UseReady>(ctx, events);
+            return RunMergedPush<2, UseReady, PushGroup>(ctx, events);
         }
     }
+}
+
+template <bool UseReady, uint32_t PushGroup = 0>
+CcuResult RunPushWithConfiguredDepth(BroadcastContext &ctx, const BroadcastKernelArg *kernelArg)
+{
+    if (kernelArg->pushWindowDepth == 1) {
+        ccu::Event pushEvents[1];
+        return RunPush<UseReady, PushGroup>(ctx, pushEvents);
+    } else if (kernelArg->pushWindowDepth == 2) {
+        ccu::Event pushEvents[2];
+        return RunPush<UseReady, PushGroup>(ctx, pushEvents);
+    } else {
+        // Four statically expanded event paths exceed the CCU continuous-XN
+        // budget on the competition VM. Keep depth=4 as a valid host setting
+        // but execute it with the largest registerable rolling window.
+        ccu::Event pushEvents[2];
+        return RunPush<UseReady, PushGroup>(ctx, pushEvents);
+    }
+}
+
+CcuResult RunOwnerWriteControlPhase(BroadcastContext &ctx, const BroadcastKernelArg *kernelArg)
+{
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::PRESYNC_PUBLISH)) {
+        CCU_CHK_RET(PublishBufferInfo(ctx));
+    }
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::PRESYNC_WAIT)) {
+        CCU_CHK_RET(WaitBufferInfo(ctx));
+    }
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::OWNER_DONE)) {
+        CCU_IF(ctx.root == kernelArg->rankId) {
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_OWNER_DONE, true));
+            }
+        }
+        CCU_IF(ctx.root != kernelArg->rankId) {
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_OWNER_DONE, false));
+        }
+    }
+    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::GLOBAL_DONE)) {
+        CCU_IF(ctx.root == kernelArg->rankId) {
+            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
+                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_OWNER_GLOBAL_DONE, false));
+            }
+        }
+        CCU_IF(ctx.root != kernelArg->rankId) {
+            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_OWNER_GLOBAL_DONE, true));
+        }
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult RunOwnerWriteDataPhases(BroadcastContext &ctx, const BroadcastKernelArg *kernelArg)
+{
+    if (kernelArg->pushGroup == 0) {
+        CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
+            CCU_CHK_RET((RunPushWithConfiguredDepth<false, 0>(ctx, kernelArg)));
+        }
+    } else {
+        CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
+            CCU_CHK_RET((RunPushWithConfiguredDepth<false, 1>(ctx, kernelArg)));
+        }
+    }
+    return CCU_SUCCESS;
 }
 
 CcuResult ReadFullChunkFromRoot(BroadcastContext &ctx, ccu::Event &event)
@@ -480,14 +611,15 @@ CcuResult InitBroadcastResource(BroadcastContext &ctx, const BroadcastKernelArg 
         arg->rankId >= arg->rankSize || arg->rootRank >= arg->rankSize ||
         arg->dieId >= BROADCAST_CCU_DIE_NUM ||
         arg->seedDie >= BROADCAST_CCU_DIE_NUM ||
-        arg->channelCount > arg->rankSize - 1 ||
+        arg->channelCount > arg->rankSize - 1 || arg->pushGroup > 1 ||
         (arg->activeDieMask & (1U << arg->dieId)) == 0) {
         return CCU_E_PARA;
     }
     bool seen[MAX_RANK_SIZE]{};
     for (uint32_t i = 0; i < arg->channelCount; ++i) {
         const uint32_t peerRank = arg->remoteRanks[i];
-        if (peerRank >= arg->rankSize || peerRank == arg->rankId || seen[peerRank]) {
+        if (peerRank >= arg->rankSize || peerRank == arg->rankId || seen[peerRank] ||
+            arg->peerGroups[i] > 1) {
             return CCU_E_PARA;
         }
         seen[peerRank] = true;
@@ -615,64 +747,62 @@ CcuResult CcuBroadcastOwnerSeedKernel(CcuKernelArg arg)
     return CCU_SUCCESS;
 }
 
+CcuResult CcuBroadcastOwnerSegmentPushKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
+    BroadcastContext ctx;
+    CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
+    CCU_CHK_RET(LoadOwnerWriteArgs(ctx));
+    CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
+        CCU_CHK_RET(RunPushWithConfiguredDepth<false>(ctx, kernelArg));
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult CcuBroadcastOwnerControlKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
+    BroadcastContext ctx;
+    ccu::Event readEvent;
+    CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
+    CCU_CHK_RET(LoadOwnerWriteArgs(ctx));
+    CCU_CHK_RET(RunOwnerWriteControlPhase(ctx, kernelArg));
+    CCU_CHK_RET(RunOwnerWriteDataPhases(ctx, kernelArg));
+    CCU_IF(ctx.kernelPhase == OWNER_SEGMENT_PULL_PHASE) {
+        ccu::Variable offset;
+        offset = 0;
+        // Host Thread Notify publishes the segment only after this complete
+        // receiver-pull finishes, so no cross-Die CCU event is involved.
+        CCU_CHK_RET(ReadSeedTile(ctx, offset, ctx.ownerBytes, readEvent));
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult CcuBroadcastRootOwnerWriteKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
+    BroadcastContext ctx;
+    CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
+    CCU_CHK_RET(LoadOwnerWriteArgs(ctx));
+    CCU_CHK_RET(RunOwnerWriteControlPhase(ctx, kernelArg));
+    // Root data is immediately readable on every local Die, so both group
+    // paths intentionally have no Ready-ring dependency.
+    CCU_CHK_RET(RunOwnerWriteDataPhases(ctx, kernelArg));
+    return CCU_SUCCESS;
+}
+
 CcuResult CcuBroadcastContiguousOwnerWriteKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<BroadcastKernelArg *>(arg);
     BroadcastContext ctx;
     CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
     CCU_CHK_RET(LoadOwnerWriteArgs(ctx));
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::PRESYNC_PUBLISH)) {
-        CCU_CHK_RET(PublishBufferInfo(ctx));
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::PRESYNC_WAIT)) {
-        CCU_CHK_RET(WaitBufferInfo(ctx));
-    }
-    if (kernelArg->pushWindowDepth == 1) {
-        ccu::Event pushEvents[1];
-        CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
-            if (kernelArg->dieId == kernelArg->seedDie) {
-                CCU_CHK_RET(RunPush<true>(ctx, pushEvents));
-            } else {
-                CCU_CHK_RET(RunPush<false>(ctx, pushEvents));
-            }
-        }
-    } else if (kernelArg->pushWindowDepth == 2) {
-        ccu::Event pushEvents[2];
-        CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
-            if (kernelArg->dieId == kernelArg->seedDie) {
-                CCU_CHK_RET(RunPush<true>(ctx, pushEvents));
-            } else {
-                CCU_CHK_RET(RunPush<false>(ctx, pushEvents));
-            }
-        }
-    } else {
-        ccu::Event pushEvents[4];
-        CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
-            if (kernelArg->dieId == kernelArg->seedDie) {
-                CCU_CHK_RET(RunPush<true>(ctx, pushEvents));
-            } else {
-                CCU_CHK_RET(RunPush<false>(ctx, pushEvents));
-            }
-        }
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::OWNER_DONE)) {
-        CCU_IF(ctx.root == kernelArg->rankId) {
-            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_OWNER_DONE, true));
-            }
-        }
-        CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_OWNER_DONE, false));
-        }
-    }
-    CCU_IF(ctx.kernelPhase == static_cast<uint64_t>(OwnerWritePhase::GLOBAL_DONE)) {
-        CCU_IF(ctx.root == kernelArg->rankId) {
-            for (uint32_t i = 0; i < ctx.arg->channelCount; ++i) {
-                CCU_CHK_RET(NotifyPhase(ctx.arg->channels[i], NOTIFY_OWNER_GLOBAL_DONE, false));
-            }
-        }
-        CCU_IF(ctx.root != kernelArg->rankId) {
-            CCU_CHK_RET(NotifyRoot(ctx, NOTIFY_OWNER_GLOBAL_DONE, true));
+    CCU_CHK_RET(RunOwnerWriteControlPhase(ctx, kernelArg));
+    CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
+        if (kernelArg->dieId == kernelArg->seedDie) {
+            CCU_CHK_RET(RunPushWithConfiguredDepth<true>(ctx, kernelArg));
+        } else {
+            CCU_CHK_RET(RunPushWithConfiguredDepth<false>(ctx, kernelArg));
         }
     }
     return CCU_SUCCESS;

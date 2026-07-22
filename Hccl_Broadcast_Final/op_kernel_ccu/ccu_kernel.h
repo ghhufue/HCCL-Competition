@@ -72,6 +72,9 @@ CcuResult WaitBufferInfo(BroadcastContext &ctx);
 CcuResult PreSyncBufferInfo(BroadcastContext &ctx);
 CcuResult CcuBroadcastSmallReceiverPullKernel(CcuKernelArg arg);
 CcuResult CcuBroadcastOwnerSeedKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastOwnerSegmentPushKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastOwnerControlKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastRootOwnerWriteKernel(CcuKernelArg arg);
 CcuResult CcuBroadcastContiguousOwnerWriteKernel(CcuKernelArg arg);
 
 } // namespace ops_hccl
