@@ -1,5 +1,15 @@
 # HCCL Broadcast Competition
 
+## 官方实现参考
+
+`Hccl_Broadcast_Final/references/hccl-broadcast-reference/` 是只读的官方 HCCL 稀疏实现快照，仅用于在明确要求时查阅实现思路和接口用法。
+
+- 来源：`https://gitcode.com/cann/hccl.git`
+- 固定版本：`dd0587c`（`[fix] ar seq bugfix`）
+- 不要修改、格式化或重写该目录中的官方实现文件。
+- 除非任务明确要求参考官方实现，否则不要检索该目录，也不要把其中的大段代码加载到 AI 上下文中。
+- 需要参考时只读取与当前问题直接相关的最小文件和最小代码范围，优先总结设计，不复制大段实现。
+
 本仓库用于实现 HCCL 自定义 `Broadcast` 集合通信算子。初赛已经结束，相关题目、代码和实现分析现作为历史资料保留；当前开发目标是决赛题目。
 
 决赛延续初赛的 Broadcast 语义和基本开发流程，但更换了评测拓扑，并将通信引擎从 `AICPU + TS` 改为 `CCU`。因此，初赛的算法设计和验证经验仍有参考价值，但资源申请、Kernel 编排和拓扑优化需要按决赛模板重新实现。
