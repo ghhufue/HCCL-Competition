@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -33,7 +34,7 @@ namespace {
 
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t THREAD_NOTIFY_NUM = 1;
-constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v9";
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v10";
 
 HcclResult ValidateBroadcastParam(const OpParam &param)
 {
@@ -85,6 +86,67 @@ bool SymmetricLinkLess(const CommLink &left, const CommLink &right)
         (firstCompare == 0 && CompareEndpointAddress(*leftSecond, *rightSecond) < 0);
 }
 
+uint64_t SymmetricLinkKey(const CommLink &link)
+{
+    const EndpointDesc *first = &link.srcEndpointDesc;
+    const EndpointDesc *second = &link.dstEndpointDesc;
+    if (CompareEndpointAddress(*first, *second) > 0) {
+        std::swap(first, second);
+    }
+    constexpr uint64_t FNV_OFFSET_BASIS = 1469598103934665603ULL;
+    constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+    uint64_t hash = FNV_OFFSET_BASIS;
+    for (uint32_t i = 0; i < COMM_ADDR_EID_LEN; ++i) {
+        hash = (hash ^ first->commAddr.eid[i]) * FNV_PRIME;
+    }
+    for (uint32_t i = 0; i < COMM_ADDR_EID_LEN; ++i) {
+        hash = (hash ^ second->commAddr.eid[i]) * FNV_PRIME;
+    }
+    return hash;
+}
+
+uint32_t SymmetricLinkIndex(uint32_t rankA, uint32_t rankB, uint32_t candidateCount)
+{
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(rankA) + static_cast<uint64_t>(rankB)) % candidateCount);
+}
+
+const char *ProtocolName(CommProtocol protocol)
+{
+    switch (protocol) {
+        case CommProtocol::COMM_PROTOCOL_UBC_CTP:
+            return "CTP";
+        case CommProtocol::COMM_PROTOCOL_UBC_TP:
+            return "TP";
+        default:
+            return "OTHER";
+    }
+}
+
+const char *TopologyName(CommTopo topology)
+{
+    switch (topology) {
+        case COMM_TOPO_CLOS:
+            return "CLOS";
+        case COMM_TOPO_1DMESH:
+            return "MESH";
+        case COMM_TOPO_CUSTOM:
+            return "CUSTOM";
+        default:
+            return "OTHER";
+    }
+}
+
+const char *LinkScopeName(const CommLink &link)
+{
+    if (link.srcEndpointDesc.loc.locType != ENDPOINT_LOC_TYPE_DEVICE ||
+        link.dstEndpointDesc.loc.locType != ENDPOINT_LOC_TYPE_DEVICE) {
+        return "UNKNOWN";
+    }
+    return link.srcEndpointDesc.loc.device.serverIdx == link.dstEndpointDesc.loc.device.serverIdx ?
+        "INTRA_SERVER" : "INTER_SERVER";
+}
+
 HcclResult QueryBestCcuLinkToPeer(
     HcclComm comm, uint32_t myRank, uint32_t remoteRank, HcclChannelDesc &desc, uint32_t &localDieId)
 {
@@ -100,14 +162,21 @@ HcclResult QueryBestCcuLinkToPeer(
     };
     bool found = false;
     CommLink selected{};
+    uint32_t selectedLayer = 0;
+    uint32_t selectedCandidateCount = 0;
+    uint32_t selectedCandidateDieMask = 0;
+    uint32_t selectedCandidateIndex = 0;
     for (const auto protocol : preferredProtocols) {
         if (protocol == CommProtocol::COMM_PROTOCOL_RESERVED) {
             continue;
         }
-        for (uint32_t layerIdx = 0; layerIdx < netLayerNum && !found; ++layerIdx) {
+        for (uint32_t layerIdx = 0; layerIdx < netLayerNum; ++layerIdx) {
             CommLink *links = nullptr;
             uint32_t linkNum = 0;
             CHK_RET(HcclRankGraphGetLinks(comm, netLayers[layerIdx], myRank, remoteRank, &links, &linkNum));
+            std::vector<CommLink> candidates;
+            candidates.reserve(linkNum);
+            uint32_t candidateDieMask = 0;
             for (uint32_t linkIdx = 0; linkIdx < linkNum; ++linkIdx) {
                 if (links[linkIdx].linkAttr.linkProtocol != protocol) {
                     continue;
@@ -117,14 +186,24 @@ HcclResult QueryBestCcuLinkToPeer(
                         comm, myRank, links[linkIdx].srcEndpointDesc, candidateLocalDie) != HCCL_SUCCESS) {
                     continue;
                 }
-                // The endpoint-pair order is invariant when src/dst are reversed,
-                // so both ranks select exactly the same physical link without
-                // querying attributes of the remote EndpointDesc.
-                if (!found || SymmetricLinkLess(links[linkIdx], selected)) {
-                    selected = links[linkIdx];
-                }
-                found = true;
+                candidates.push_back(links[linkIdx]);
+                candidateDieMask |= 1U << candidateLocalDie;
             }
+            if (candidates.empty()) {
+                continue;
+            }
+            // Both ranks observe the same endpoint pairs with src/dst reversed.
+            // Sorting by the canonical endpoint pair and using a rank-pair slot
+            // therefore selects the same physical Channel at both ends without
+            // querying any attribute of the remote EndpointDesc.
+            std::sort(candidates.begin(), candidates.end(), SymmetricLinkLess);
+            selectedCandidateCount = static_cast<uint32_t>(candidates.size());
+            selectedCandidateIndex = SymmetricLinkIndex(myRank, remoteRank, selectedCandidateCount);
+            selectedCandidateDieMask = candidateDieMask;
+            selected = candidates[selectedCandidateIndex];
+            selectedLayer = netLayers[layerIdx];
+            found = true;
+            break;
         }
         if (found) {
             break;
@@ -137,8 +216,16 @@ HcclResult QueryBestCcuLinkToPeer(
     CHK_RET(GetEndpointDieId(comm, myRank, selected.srcEndpointDesc, localDieId));
     CHK_PRT_RET(localDieId >= BROADCAST_CCU_DIE_NUM,
         HCCL_ERROR("[QueryBestCcuLinkToPeer] invalid local die=%u", localDieId), HCCL_E_INTERNAL);
-    HCCL_DEBUG("[QueryBestCcuLinkToPeer] rank=%u peer=%u selectedDie=%u",
-        myRank, remoteRank, localDieId);
+    if (LOG_LEVEL <= LOG_LEVEL_INFO) {
+        CommTopo selectedTopo = COMM_TOPO_RESERVED;
+        (void)HcclRankGraphGetTopoTypeByLayer(comm, selectedLayer, &selectedTopo);
+        HCCL_INFO("[BroadcastChannelDiag] rank=%u peer=%u protocol=%s layer=%u topology=%s scope=%s "
+            "localDie=%u candidateIndex=%u candidateCount=%u candidateDieMask=0x%x channelKey=%016llx",
+            myRank, remoteRank, ProtocolName(selected.linkAttr.linkProtocol), selectedLayer,
+            TopologyName(selectedTopo), LinkScopeName(selected), localDieId, selectedCandidateIndex,
+            selectedCandidateCount, selectedCandidateDieMask,
+            static_cast<unsigned long long>(SymmetricLinkKey(selected)));
+    }
     CHK_RET(HcclChannelDescInit(&desc, 1));
     desc.remoteRank = remoteRank;
     desc.notifyNum = CHANNEL_NOTIFY_NUM;
@@ -192,7 +279,7 @@ HcclResult AcquireAllPeerChannels(
         remoteRanksByDie[localDies[i]].push_back(remoteRanks[i]);
         peerDieByRank[remoteRanks[i]] = localDies[i];
     }
-    HCCL_DEBUG("[AcquireAllPeerChannels] rank=%u die0Peers=%zu die1Peers=%zu",
+    HCCL_INFO("[AcquireAllPeerChannels] rank=%u die0Peers=%zu die1Peers=%zu",
         param.myRank, channelsByDie[0].size(), channelsByDie[1].size());
     return HCCL_SUCCESS;
 }
@@ -267,6 +354,8 @@ HcclResult RegisterBroadcastKernels(HcclComm comm, const OpParam &param,
             HCCL_ERROR("[RegisterBroadcastKernels] invalid seed die=%u", seedDie);
             ret = HCCL_E_INTERNAL;
         }
+        HCCL_INFO("[BroadcastChannelSummary] rank=%u root=%u die0Peers=%zu die1Peers=%zu seedDie=%u",
+            param.myRank, param.root, channelsByDie[0].size(), channelsByDie[1].size(), seedDie);
     }
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM && ret == HCCL_SUCCESS; ++dieId) {
         if (channelsByDie[dieId].empty()) {
