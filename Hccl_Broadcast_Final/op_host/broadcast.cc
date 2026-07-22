@@ -8,15 +8,348 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include <hccl/hccl_res_expt.h>
-#include <hccl/hccl_rank_graph.h>
-#include <hccl/hccl_diag.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
 
-#include "log.h"
+#include <hccl/hccl_diag.h>
+#include <hccl/hccl_ccu_res.h>
+#include <hccl/hccl_rank_graph.h>
+#include <hccl/hccl_res_expt.h>
+#include <ccu/ccu_launch.h>
+
+#include "ccu_kernel.h"
 #include "common.h"
 #include "custom.h"
-#include "hccl.h"
 #include "exec_op.h"
+#include "hccl.h"
+#include "log.h"
+
+namespace {
+
+constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
+constexpr uint32_t THREAD_NOTIFY_NUM = 1;
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v9";
+
+HcclResult ValidateBroadcastParam(const OpParam &param)
+{
+    const auto sizeIt = SIZE_TABLE.find(param.dataType);
+    CHK_PRT_RET(sizeIt == SIZE_TABLE.end(),
+        HCCL_ERROR("[ValidateBroadcastParam] only FP32 is supported, dataType=%d", param.dataType), HCCL_E_PARA);
+    CHK_PRT_RET(param.rankSize == 0 || param.rankSize > MAX_RANK_SIZE,
+        HCCL_ERROR("[ValidateBroadcastParam] invalid rankSize=%u", param.rankSize), HCCL_E_PARA);
+    CHK_PRT_RET(param.myRank >= param.rankSize,
+        HCCL_ERROR("[ValidateBroadcastParam] invalid rank=%u for rankSize=%u", param.myRank, param.rankSize),
+        HCCL_E_PARA);
+    CHK_PRT_RET(param.root >= param.rankSize,
+        HCCL_ERROR("[ValidateBroadcastParam] invalid root=%u for rankSize=%u", param.root, param.rankSize),
+        HCCL_E_PARA);
+    CHK_PRT_RET(param.count > std::numeric_limits<uint64_t>::max() / sizeIt->second,
+        HCCL_ERROR("[ValidateBroadcastParam] byte size overflows uint64_t"), HCCL_E_PARA);
+    return HCCL_SUCCESS;
+}
+
+HcclResult GetEndpointDieId(
+    HcclComm comm, uint32_t rankId, const EndpointDesc &endpoint, uint32_t &dieId)
+{
+    EndpointAttrDieId endpointDieId = 0;
+    CHK_RET(HcclRankGraphGetEndpointInfo(comm, rankId, &endpoint,
+        ENDPOINT_ATTR_DIE_ID, sizeof(endpointDieId), &endpointDieId));
+    dieId = endpointDieId;
+    return dieId < BROADCAST_CCU_DIE_NUM ? HCCL_SUCCESS : HCCL_E_INTERNAL;
+}
+
+int CompareEndpointAddress(const EndpointDesc &left, const EndpointDesc &right)
+{
+    return std::memcmp(left.commAddr.eid, right.commAddr.eid, COMM_ADDR_EID_LEN);
+}
+
+bool SymmetricLinkLess(const CommLink &left, const CommLink &right)
+{
+    const EndpointDesc *leftFirst = &left.srcEndpointDesc;
+    const EndpointDesc *leftSecond = &left.dstEndpointDesc;
+    if (CompareEndpointAddress(*leftFirst, *leftSecond) > 0) {
+        std::swap(leftFirst, leftSecond);
+    }
+    const EndpointDesc *rightFirst = &right.srcEndpointDesc;
+    const EndpointDesc *rightSecond = &right.dstEndpointDesc;
+    if (CompareEndpointAddress(*rightFirst, *rightSecond) > 0) {
+        std::swap(rightFirst, rightSecond);
+    }
+    const int firstCompare = CompareEndpointAddress(*leftFirst, *rightFirst);
+    return firstCompare < 0 ||
+        (firstCompare == 0 && CompareEndpointAddress(*leftSecond, *rightSecond) < 0);
+}
+
+HcclResult QueryBestCcuLinkToPeer(
+    HcclComm comm, uint32_t myRank, uint32_t remoteRank, HcclChannelDesc &desc, uint32_t &localDieId)
+{
+    uint32_t *netLayers = nullptr;
+    uint32_t netLayerNum = 0;
+    CHK_RET(HcclRankGraphGetLayers(comm, &netLayers, &netLayerNum));
+    CHK_PRT_RET(netLayers == nullptr || netLayerNum == 0,
+        HCCL_ERROR("[QueryBestCcuLinkToPeer] no network layer for rank %u", remoteRank), HCCL_E_NOT_FOUND);
+
+    const CommProtocol preferredProtocols[] = {
+        CommProtocol::COMM_PROTOCOL_UBC_CTP,
+        CommProtocol::COMM_PROTOCOL_UBC_TP,
+    };
+    bool found = false;
+    CommLink selected{};
+    for (const auto protocol : preferredProtocols) {
+        if (protocol == CommProtocol::COMM_PROTOCOL_RESERVED) {
+            continue;
+        }
+        for (uint32_t layerIdx = 0; layerIdx < netLayerNum && !found; ++layerIdx) {
+            CommLink *links = nullptr;
+            uint32_t linkNum = 0;
+            CHK_RET(HcclRankGraphGetLinks(comm, netLayers[layerIdx], myRank, remoteRank, &links, &linkNum));
+            for (uint32_t linkIdx = 0; linkIdx < linkNum; ++linkIdx) {
+                if (links[linkIdx].linkAttr.linkProtocol != protocol) {
+                    continue;
+                }
+                uint32_t candidateLocalDie = 0;
+                if (GetEndpointDieId(
+                        comm, myRank, links[linkIdx].srcEndpointDesc, candidateLocalDie) != HCCL_SUCCESS) {
+                    continue;
+                }
+                // The endpoint-pair order is invariant when src/dst are reversed,
+                // so both ranks select exactly the same physical link without
+                // querying attributes of the remote EndpointDesc.
+                if (!found || SymmetricLinkLess(links[linkIdx], selected)) {
+                    selected = links[linkIdx];
+                }
+                found = true;
+            }
+        }
+        if (found) {
+            break;
+        }
+    }
+
+    if (!found) {
+        return HCCL_E_NOT_FOUND;
+    }
+    CHK_RET(GetEndpointDieId(comm, myRank, selected.srcEndpointDesc, localDieId));
+    CHK_PRT_RET(localDieId >= BROADCAST_CCU_DIE_NUM,
+        HCCL_ERROR("[QueryBestCcuLinkToPeer] invalid local die=%u", localDieId), HCCL_E_INTERNAL);
+    HCCL_DEBUG("[QueryBestCcuLinkToPeer] rank=%u peer=%u selectedDie=%u",
+        myRank, remoteRank, localDieId);
+    CHK_RET(HcclChannelDescInit(&desc, 1));
+    desc.remoteRank = remoteRank;
+    desc.notifyNum = CHANNEL_NOTIFY_NUM;
+    desc.channelProtocol = selected.linkAttr.linkProtocol;
+    desc.localEndpoint.protocol = selected.srcEndpointDesc.protocol;
+    desc.localEndpoint.commAddr = selected.srcEndpointDesc.commAddr;
+    desc.localEndpoint.loc = selected.srcEndpointDesc.loc;
+    desc.remoteEndpoint.protocol = selected.dstEndpointDesc.protocol;
+    desc.remoteEndpoint.commAddr = selected.dstEndpointDesc.commAddr;
+    desc.remoteEndpoint.loc = selected.dstEndpointDesc.loc;
+    return HCCL_SUCCESS;
+}
+
+HcclResult AcquireAllPeerChannels(
+    HcclComm comm, const OpParam &param,
+    std::vector<ChannelHandle> (&channelsByDie)[BROADCAST_CCU_DIE_NUM],
+    std::vector<uint32_t> (&remoteRanksByDie)[BROADCAST_CCU_DIE_NUM], uint32_t *peerDieByRank)
+{
+    CHK_PTR_NULL(peerDieByRank);
+    const uint32_t channelCount = param.rankSize - 1;
+    std::vector<HcclChannelDesc> descs;
+    std::vector<uint32_t> localDies;
+    std::vector<uint32_t> remoteRanks;
+    descs.reserve(channelCount);
+    localDies.reserve(channelCount);
+    remoteRanks.reserve(channelCount);
+
+    for (uint32_t remoteRank = 0; remoteRank < param.rankSize; ++remoteRank) {
+        if (remoteRank == param.myRank) {
+            continue;
+        }
+        HcclChannelDesc desc;
+        uint32_t localDieId = 0;
+        CHK_RET(QueryBestCcuLinkToPeer(comm, param.myRank, remoteRank, desc, localDieId));
+        descs.push_back(desc);
+        localDies.push_back(localDieId);
+        remoteRanks.push_back(remoteRank);
+    }
+
+    CHK_PRT_RET(descs.size() != channelCount || localDies.size() != channelCount ||
+            remoteRanks.size() != channelCount,
+        HCCL_ERROR("[AcquireAllPeerChannels] channel map is incomplete"), HCCL_E_INTERNAL);
+
+    std::vector<ChannelHandle> allChannels(channelCount);
+    if (channelCount != 0) {
+        CHK_RET(HcclChannelAcquire(
+            comm, CommEngine::COMM_ENGINE_CCU, descs.data(), channelCount, allChannels.data()));
+    }
+    for (uint32_t i = 0; i < channelCount; ++i) {
+        channelsByDie[localDies[i]].push_back(allChannels[i]);
+        remoteRanksByDie[localDies[i]].push_back(remoteRanks[i]);
+        peerDieByRank[remoteRanks[i]] = localDies[i];
+    }
+    HCCL_DEBUG("[AcquireAllPeerChannels] rank=%u die0Peers=%zu die1Peers=%zu",
+        param.myRank, channelsByDie[0].size(), channelsByDie[1].size());
+    return HCCL_SUCCESS;
+}
+
+std::shared_ptr<BroadcastKernelArg> BuildKernelArg(const OpParam &param,
+    const std::vector<ChannelHandle> &channels, const std::vector<uint32_t> &remoteRanks,
+    uint32_t dieId, uint32_t seedDie, uint32_t activeDieMask,
+    const ops_hccl::OwnerWriteConfig &config)
+{
+    auto arg = std::make_shared<BroadcastKernelArg>();
+    arg->rankSize = param.rankSize;
+    arg->rankId = param.myRank;
+    arg->rootRank = param.root;
+    arg->dieId = dieId;
+    arg->seedDie = seedDie;
+    arg->activeDieMask = activeDieMask;
+    arg->pushWindowDepth = config.pushWindowDepth;
+    arg->enablePushBatchMerge = config.enablePushBatchMerge ? 1U : 0U;
+    arg->channelCount = static_cast<uint32_t>(channels.size());
+    for (uint32_t i = 0; i < arg->channelCount; ++i) {
+        arg->channels[i] = channels[i];
+        arg->remoteRanks[i] = remoteRanks[i];
+    }
+    return arg;
+}
+
+HcclResult RegisterOneKernel(CcuInsHandle insHandle, uint32_t dieId, const char *name, void *kernelFunc,
+    const std::shared_ptr<BroadcastKernelArg> &kernelArg, CcuKernelHandle &kernelHandle)
+{
+    const void *kernelArgs[] = {kernelArg.get()};
+    CcuResult ret = HcommCcuKernelRegister(
+        insHandle, dieId, name, kernelFunc, kernelArgs, 1, &kernelHandle);
+    if (ret != CCU_SUCCESS) {
+        HCCL_ERROR("[RegisterOneKernel] failed to register %s, ccuRet=%d", name, ret);
+        return ConvertCcuToHccl(ret);
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult RegisterBroadcastKernels(HcclComm comm, const OpParam &param,
+    const std::vector<ChannelHandle> (&channelsByDie)[BROADCAST_CCU_DIE_NUM],
+    const std::vector<uint32_t> (&remoteRanksByDie)[BROADCAST_CCU_DIE_NUM],
+    const ops_hccl::OwnerWriteConfig &config, KernelKind algorithm, AlgResourceCtx &resCtx)
+{
+    CcuInsHandle insHandle{0};
+    uint32_t insNum = 0;
+    CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
+    CHK_PRT_RET(insNum != 1,
+        HCCL_ERROR("[RegisterBroadcastKernels] expected one CCU instance, got %u", insNum), HCCL_E_INTERNAL);
+
+    CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
+
+    HcclResult ret = HCCL_SUCCESS;
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if (!channelsByDie[dieId].empty()) {
+            resCtx.activeDieMask |= 1U << dieId;
+        }
+    }
+    uint32_t seedDie = BROADCAST_CCU_DIE_NUM;
+    if (algorithm == KernelKind::CONTIGUOUS_OWNER_WRITE) {
+        if (param.myRank != param.root) {
+            seedDie = resCtx.peerDieByRank[param.root];
+        } else {
+            for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+                if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+                    seedDie = dieId;
+                    break;
+                }
+            }
+        }
+        if (seedDie >= BROADCAST_CCU_DIE_NUM) {
+            HCCL_ERROR("[RegisterBroadcastKernels] invalid seed die=%u", seedDie);
+            ret = HCCL_E_INTERNAL;
+        }
+    }
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM && ret == HCCL_SUCCESS; ++dieId) {
+        if (channelsByDie[dieId].empty()) {
+            continue;
+        }
+        if (algorithm == KernelKind::SMALL_RECEIVER_PULL) {
+            auto smallPullArg = BuildKernelArg(
+                param, channelsByDie[dieId], remoteRanksByDie[dieId], dieId, dieId,
+                resCtx.activeDieMask, config);
+            ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastSmallReceiverPullKernel",
+                reinterpret_cast<void *>(ops_hccl::CcuBroadcastSmallReceiverPullKernel), smallPullArg,
+                resCtx.smallPullKernels[dieId]);
+        } else {
+            auto ownerWriteArg = BuildKernelArg(
+                param, channelsByDie[dieId], remoteRanksByDie[dieId], dieId, seedDie,
+                resCtx.activeDieMask, config);
+            ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastContiguousOwnerWriteKernel",
+                reinterpret_cast<void *>(ops_hccl::CcuBroadcastContiguousOwnerWriteKernel), ownerWriteArg,
+                resCtx.ownerWriteKernels[dieId]);
+            if (ret == HCCL_SUCCESS && dieId == seedDie) {
+                auto seedArg = BuildKernelArg(
+                    param, channelsByDie[dieId], remoteRanksByDie[dieId], dieId, seedDie,
+                    resCtx.activeDieMask, config);
+                ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastOwnerSeedKernel",
+                    reinterpret_cast<void *>(ops_hccl::CcuBroadcastOwnerSeedKernel), seedArg,
+                    resCtx.seedKernels[dieId]);
+            }
+        }
+    }
+
+    if (ret == HCCL_SUCCESS && resCtx.activeDieMask == 0) {
+        ret = HCCL_E_INTERNAL;
+    }
+
+    const CcuResult endRet = HcommCcuKernelRegisterEnd(insHandle);
+    if (ret != HCCL_SUCCESS) {
+        return ret;
+    }
+    if (endRet != CCU_SUCCESS) {
+        HCCL_ERROR("[RegisterBroadcastKernels] register end failed, ccuRet=%d", endRet);
+        return ConvertCcuToHccl(endRet);
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult AcquirePushThreads(HcclComm comm, AlgResourceCtx &resCtx)
+{
+    uint32_t activeCount = 0;
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        activeCount += (resCtx.activeDieMask & (1U << dieId)) != 0 ? 1U : 0U;
+    }
+    CHK_PRT_RET(activeCount == 0 || activeCount > BROADCAST_CCU_DIE_NUM,
+        HCCL_ERROR("[AcquirePushThreads] invalid active die count=%u", activeCount), HCCL_E_INTERNAL);
+    ThreadHandle acquired[BROADCAST_CCU_DIE_NUM]{};
+    CHK_RET(HcclThreadAcquire(
+        comm, CommEngine::COMM_ENGINE_CCU, activeCount, THREAD_NOTIFY_NUM, acquired));
+    uint32_t threadIdx = 0;
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+            resCtx.pushThreads[dieId] = acquired[threadIdx++];
+        }
+    }
+    resCtx.pushThreadCount = activeCount;
+    HCCL_DEBUG("[AcquirePushThreads] activeDieMask=%u pushThreadCount=%u", resCtx.activeDieMask,
+        resCtx.pushThreadCount);
+    return HCCL_SUCCESS;
+}
+
+HcclResult CreateAndStoreEngineContext(HcclComm comm, const OpParam &param, const AlgResourceCtx &resCtx)
+{
+    std::vector<char> seq = resCtx.Serialize();
+    CHK_PRT_RET(seq.size() != AlgResourceCtx::SerializedSize(),
+        HCCL_ERROR("[CreateAndStoreEngineContext] unexpected serialized size=%zu", seq.size()), HCCL_E_INTERNAL);
+    void *ctx = nullptr;
+    CHK_RET(HcclEngineCtxCreate(
+        comm, param.tag, CommEngine::COMM_ENGINE_CCU, static_cast<uint64_t>(seq.size()), &ctx));
+    CHK_PTR_NULL(ctx);
+    CHK_RET(HcclEngineCtxCopy(
+        comm, CommEngine::COMM_ENGINE_CCU, param.tag, seq.data(), static_cast<uint64_t>(seq.size()), 0));
+    return HCCL_SUCCESS;
+}
+
+} // namespace
 
 HcclResult HcclBroadcast(
     void *buf, uint64_t count, HcclDataType dataType, uint32_t root, HcclComm comm, aclrtStream stream)
@@ -25,92 +358,76 @@ HcclResult HcclBroadcast(
     CHK_PTR_NULL(comm);
     CHK_PTR_NULL(stream);
 
-    // 构造算子参数
+    ops_hccl::OwnerWriteConfig ownerWriteConfig;
+    CHK_RET(ops_hccl::LoadOwnerWriteConfig(ownerWriteConfig));
     OpParam param;
-    sprintf(param.tag, "%s", "hccl_custom_broadcast");
     param.inputPtr = buf;
     param.outputPtr = buf;
     param.count = count;
+    param.root = root;
     param.dataType = dataType;
     param.opType = HcclCMDType::HCCL_CMD_BROADCAST;
+    CHK_RET(HcclGetRankId(comm, &param.myRank));
+    CHK_RET(HcclGetRankSize(comm, &param.rankSize));
+    CHK_RET(ValidateBroadcastParam(param));
 
-    // 注册算子信息
-    HcclDfxOpInfo dfxInfo;
-    char commName[COMM_INDENTIFIER_MAX_LENGTH];
+    HcclDfxOpInfo dfxInfo{};
+    char commName[COMM_INDENTIFIER_MAX_LENGTH]{};
     CHK_RET(HcclGetCommName(comm, commName));
     CHK_RET(HcclDfxRegOpInfoByCommId(commName, reinterpret_cast<void *>(&dfxInfo)));
 
-    // ==============================================
-    // STEP 1: 解析拓扑信息
-    // ==============================================
-    CHK_RET(HcclGetRankId(comm, &param.myRank));
-    CHK_RET(HcclGetRankSize(comm, &param.rankSize));
-
-    // ==============================================
-    // STEP 2: 创建资源
-    // ==============================================
-    CommEngine ccuEngine = CommEngine::COMM_ENGINE_CCU;
-
-    // ==============================================
-    // STEP 2.1: 申请用于 Host/Device 同步的通信资源
-    // ==============================================
-    // 将用户传入的 stream 转换为 CCU 通信引擎中的 thread，并申请 1 个 notify
-    CHK_RET(HcclThreadAcquireWithStream(comm, ccuEngine, stream, 1, &param.cpuThread));
-
-    void *ctx = nullptr;
-    uint64_t size = 0;
-    if (HcclEngineCtxGet(comm, param.tag, ccuEngine, &ctx, &size) == HCCL_SUCCESS) {
-        // CCU 资源已经存在，复用资源
-        HCCL_INFO("Engine context already exists");
-        param.resCtx = ctx;
-        param.ctxSize = size;
-    } else {
-        // Device 资源不存在，资源构建
-        AlgResourceCtx resCtxHost;
-
-        // 从通信域获取 HCCL Buffer（Device上的内存，默认总大小400MB）
-        void *cclBufferAddr;
-        uint64_t cclBufferSize;
-        CHK_RET(HcclGetHcclBuffer(comm, &cclBufferAddr, &cclBufferSize));
-        resCtxHost.localBuffer = CommBuffer{cclBufferAddr, cclBufferSize};
-
-        // ==============================================
-        // STEP 2.2: 申请资源：Thread、Channel、CCU Kernel
-        // ==============================================
-
-        // TODO: 根据通信算法申请 Thread 资源
-        // 创建 CCU 通信引擎上的 thread 资源
-        uint32_t threadNum = 1;          // TODO: 按需修改所申请的 Thread 数量（>=1）
-        uint32_t notifyNumPerThread = 1; // TODO: 按需修改所申请的 Thread 上的 Notify 数量（>=1）
-
-        resCtxHost.threads.resize(threadNum);
-        resCtxHost.threads[0] = param.cpuThread;
-        if (threadNum > 1) {
-            CHK_RET(HcclThreadAcquire(comm, ccuEngine, threadNum - 1, notifyNumPerThread, &resCtxHost.threads[1]));
-        }
-
-        // TODO: 根据通信算法申请 Channel 资源
-        // 调用 HcclRankGraphGetLinks()、HcclChannelDescInit()、HcclChannelAcquire() 等接口按需申请 Channel 资源
-
-        // TODO: 申请并注册 CCU Kernel 资源
-        // 调用 HcclCommQueryCcuIns()、HcommCcuKernelRegisterStart()、HcommCcuKernelRegister()、
-        //      HcommCcuKernelRegisterEnd() 等接口按需申请 1 个或多个 CCU Kernel 资源，并完成注册
-        // NOTE: 如果有多个 CCU Kernel，则需要分别注册
-
-        // ==============================================
-        // STEP 2.3: 申请通信引擎上下文
-        // ==============================================
-        // 申请 CCU 通信引擎上下文，存放 AlgResourceCtx 信息
-        std::vector<char> seq = resCtxHost.Serialize();
-        uint64_t seqSize = seq.size();
-        param.ctxSize = seqSize;
-        CHK_RET(HcclEngineCtxCreate(comm, param.tag, ccuEngine, param.ctxSize, &param.resCtx));
-        CHK_RET(HcclEngineCtxCopy(comm, ccuEngine, param.tag, seq.data(), seqSize, 0));
+    if (count == 0 || param.rankSize == 1) {
+        return HCCL_SUCCESS;
     }
 
-    // ==============================================
-    // STEP 3: 下发 CCU Kernel
-    // ==============================================
-    CHK_RET(ops_hccl::ExecOp(param));
-    return HCCL_SUCCESS;
+    const uint64_t totalBytes = count * SIZE_TABLE.at(dataType);
+    ops_hccl::ExecutionPlan executionPlan;
+    CHK_RET(ops_hccl::BuildExecutionPlan(totalBytes, param.rankSize, param.myRank, executionPlan));
+    const KernelKind algorithm = executionPlan.algorithm;
+    const int tagRet = std::snprintf(param.tag, sizeof(param.tag),
+        "%s_r%u_a%u_d%u_m%u_t%llu_b%llu", RESOURCE_TAG, root,
+        static_cast<uint32_t>(algorithm), ownerWriteConfig.pushWindowDepth,
+        ownerWriteConfig.enablePushBatchMerge ? 1U : 0U,
+        static_cast<unsigned long long>(ownerWriteConfig.tileSizeBytes),
+        static_cast<unsigned long long>(ownerWriteConfig.maxPushBatchBytes));
+    CHK_PRT_RET(tagRet <= 0 || static_cast<size_t>(tagRet) >= sizeof(param.tag),
+        HCCL_ERROR("[HcclBroadcast] failed to create operation tag"), HCCL_E_INTERNAL);
+
+    CHK_RET(HcclThreadAcquireWithStream(
+        comm, CommEngine::COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &param.cpuThread));
+
+    void *ctx = nullptr;
+    uint64_t ctxSize = 0;
+    const HcclResult ctxRet = HcclEngineCtxGet(
+        comm, param.tag, CommEngine::COMM_ENGINE_CCU, &ctx, &ctxSize);
+    if (ctxRet == HCCL_SUCCESS) {
+        CHK_PTR_NULL(ctx);
+        param.resCtx = ctx;
+        param.ctxSize = ctxSize;
+    } else {
+        CHK_PRT_RET(ctxRet != HCCL_E_NOT_FOUND,
+            HCCL_ERROR("[HcclBroadcast] failed to query engine context, ret=%d", ctxRet), ctxRet);
+        AlgResourceCtx resCtx;
+        resCtx.rankSize = param.rankSize;
+        resCtx.rootRank = param.root;
+        resCtx.pushWindowDepth = ownerWriteConfig.pushWindowDepth;
+        resCtx.enablePushBatchMerge = ownerWriteConfig.enablePushBatchMerge ? 1U : 0U;
+        CHK_RET(HcclGetHcclBuffer(comm, &resCtx.localBuffer.addr, &resCtx.localBuffer.size));
+
+        std::vector<ChannelHandle> channelsByDie[BROADCAST_CCU_DIE_NUM];
+        std::vector<uint32_t> remoteRanksByDie[BROADCAST_CCU_DIE_NUM];
+        CHK_RET(AcquireAllPeerChannels(
+            comm, param, channelsByDie, remoteRanksByDie, resCtx.peerDieByRank));
+        CHK_RET(RegisterBroadcastKernels(
+            comm, param, channelsByDie, remoteRanksByDie, ownerWriteConfig, algorithm, resCtx));
+        CHK_RET(AcquirePushThreads(comm, resCtx));
+        CHK_RET(CreateAndStoreEngineContext(comm, param, resCtx));
+
+        CHK_RET(HcclEngineCtxGet(comm, param.tag, CommEngine::COMM_ENGINE_CCU, &ctx, &ctxSize));
+        CHK_PTR_NULL(ctx);
+        param.resCtx = ctx;
+        param.ctxSize = ctxSize;
+    }
+
+    return ops_hccl::ExecOp(param, stream);
 }

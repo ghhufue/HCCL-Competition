@@ -11,15 +11,69 @@
 #ifndef OPS_HCCL_CCU_KERNEL_H
 #define OPS_HCCL_CCU_KERNEL_H
 
+#include <cstdint>
+
 #include <ccu/ccu_types.h>
+
+#include "common.h"
+#include "custom.h"
+
+namespace ccu = ::AscendC::ccu;
 
 namespace ops_hccl {
 
-// CCU Kernel 函数
-CcuResult CcuKernel(CcuKernelArg arg);
+constexpr uint32_t MAX_PUSH_WINDOW_DEPTH = 4;
+constexpr uint32_t READY_RING_SLOTS = BROADCAST_READY_RING_SLOTS;
+static_assert(MAX_RANK_SIZE <= 16, "CCU completion masks are 16-bit rank masks");
 
-// TODO: 可编写多个 CCU Kernel 函数，以最大化性能
-// CcuResult CcuKernel2(CcuKernelArg arg);
+constexpr uint32_t BUFFER_XN_ID = 1;
+constexpr uint32_t TOKEN_XN_ID = 2;
+constexpr uint32_t CKE_PRESYNC = 0;
+constexpr uint32_t CKE_PHASE = 1;
+constexpr uint32_t MASK_BUFFER_READY = 1U << BUFFER_XN_ID;
+constexpr uint32_t MASK_TOKEN_READY = 1U << TOKEN_XN_ID;
+
+enum BroadcastNotifyMask : uint32_t {
+    NOTIFY_SMALL_READ_DONE = 1U << 0,
+    NOTIFY_SMALL_GLOBAL_DONE = 1U << 1,
+    NOTIFY_OWNER_DONE = 1U << 2,
+    NOTIFY_OWNER_GLOBAL_DONE = 1U << 3,
+};
+
+struct BroadcastContext {
+    const BroadcastKernelArg *arg;
+    ccu::Variable buffer[MAX_RANK_SIZE];
+    ccu::Variable token[MAX_RANK_SIZE];
+    ccu::Variable root;
+    ccu::Variable chunkOffset;
+    ccu::Variable chunkBytes;
+    ccu::Variable ownerOffset;
+    ccu::Variable ownerBytes;
+    ccu::Variable tileSizeBytes;
+    ccu::Variable seedFullGroupCount;
+    ccu::Variable seedFullRemainder;
+    ccu::Variable seedTailBytes;
+    ccu::Variable enablePushBatchMerge;
+    ccu::Variable maxPushBatchBytes;
+    ccu::Variable pushMergeFactor;
+    ccu::Variable pushWindowDepth;
+    ccu::Variable pushFirstBytes;
+    ccu::Variable pushLoopCount;
+    ccu::Variable pushTailBytes;
+    ccu::Variable pushTailReadyTiles;
+    ccu::Variable kernelPhase;
+};
+
+CcuResult InitBroadcastResource(BroadcastContext &ctx, const BroadcastKernelArg *arg);
+CcuResult LoadSmallBroadcastArgs(BroadcastContext &ctx);
+CcuResult LoadOwnerWriteArgs(BroadcastContext &ctx);
+CcuResult PublishBufferInfo(BroadcastContext &ctx);
+CcuResult WaitBufferInfo(BroadcastContext &ctx);
+CcuResult PreSyncBufferInfo(BroadcastContext &ctx);
+CcuResult CcuBroadcastSmallReceiverPullKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastOwnerSeedKernel(CcuKernelArg arg);
+CcuResult CcuBroadcastContiguousOwnerWriteKernel(CcuKernelArg arg);
+
 } // namespace ops_hccl
 
 #endif // OPS_HCCL_CCU_KERNEL_H

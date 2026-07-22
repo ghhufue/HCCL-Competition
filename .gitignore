@@ -1,2 +1,10 @@
-artifacts/
+artifacts/*
+!artifacts/hvm_session_lib.sh
+!artifacts/build_dynamic_root_shim.sh
+!artifacts/dynamic_root_shim.cc
+!artifacts/normalize_hvm_ranktable.py
+!artifacts/run_final_smoke.sh
+!artifacts/run_hvm_case.sh
+!artifacts/run_hvm_checker_matrix.sh
+!artifacts/run_hvm_dynamic_root.sh
 docs/current-implementation/

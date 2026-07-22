@@ -11,11 +11,48 @@
 #ifndef OPS_HCCL_CCU_EXEC_OP_H
 #define OPS_HCCL_CCU_EXEC_OP_H
 
+#include <cstdint>
+#include <vector>
+
 #include <hccl/hcomm_primitives.h>
+
 #include "common.h"
+#include "custom.h"
 
 namespace ops_hccl {
-// 执行算法任务编排
-HcclResult ExecOp(const OpParam &param);
+
+struct OwnerWriteConfig {
+    uint64_t tileSizeBytes = 4ULL * 1024ULL * 1024ULL;
+    bool enablePushBatchMerge = false;
+    uint64_t maxPushBatchBytes = 8ULL * 1024ULL * 1024ULL;
+    uint32_t pushWindowDepth = 2;
+};
+
+struct ChunkDesc {
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+    OwnerBlock owner;
+    uint64_t tileSizeBytes = 0;
+    uint64_t seedFullTileCount = 0;
+    uint64_t seedTailBytes = 0;
+    bool enablePushBatchMerge = false;
+    uint64_t maxPushBatchBytes = 0;
+    uint32_t pushWindowDepth = 2;
+    PushBatchPlan push;
+};
+
+struct ExecutionPlan {
+    KernelKind algorithm = KernelKind::CONTIGUOUS_OWNER_WRITE;
+    std::vector<ChunkDesc> chunks;
+};
+
+HcclResult LoadOwnerWriteConfig(OwnerWriteConfig &config);
+HcclResult BuildExecutionPlan(uint64_t totalBytes, uint32_t rankSize, uint32_t rankId, ExecutionPlan &plan);
+HcclResult LaunchSmallReceiverPullChunk(
+    const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
+HcclResult LaunchContiguousOwnerWriteChunk(
+    const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk);
+HcclResult ExecOp(const OpParam &param, aclrtStream stream);
+
 } // namespace ops_hccl
 #endif // OPS_HCCL_CCU_EXEC_OP_H
