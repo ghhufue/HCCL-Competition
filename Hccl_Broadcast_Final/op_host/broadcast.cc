@@ -36,7 +36,7 @@ constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t MAIN_THREAD_NOTIFY_NUM =
     1 + BROADCAST_SEGMENT_PIPELINE_DEPTH * BROADCAST_CCU_DIE_NUM * 2;
 constexpr uint32_t PUSH_THREAD_NOTIFY_NUM = 1 + BROADCAST_SEGMENT_PIPELINE_DEPTH;
-constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v16";
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v17";
 
 HcclResult ValidateBroadcastParam(const OpParam &param)
 {
@@ -134,25 +134,13 @@ const char *TopologyName(CommTopo topology)
     }
 }
 
-const char *LinkScopeName(const CommLink &link)
-{
-    if (link.srcEndpointDesc.loc.locType != ENDPOINT_LOC_TYPE_DEVICE ||
-        link.dstEndpointDesc.loc.locType != ENDPOINT_LOC_TYPE_DEVICE) {
-        return "UNKNOWN";
-    }
-    return link.srcEndpointDesc.loc.device.serverIdx == link.dstEndpointDesc.loc.device.serverIdx ?
-        "INTRA_SERVER" : "INTER_SERVER";
-}
-
 struct LinkCandidate {
     CommLink link{};
     uint32_t layer = 0;
     CommTopo topology = COMM_TOPO_RESERVED;
     uint32_t localDie = BROADCAST_CCU_DIE_NUM;
-    uint32_t remoteDie = BROADCAST_CCU_DIE_NUM;
     EndpointAttrBwCoeff bandwidthCoeff = 0;
     bool bandwidthAvailable = false;
-    uint32_t staticLoadScore = 0;
 };
 
 bool QueryEndpointDieOptional(
@@ -181,9 +169,6 @@ bool BetterLinkCandidate(const LinkCandidate &left, const LinkCandidate &right)
     if (left.bandwidthAvailable && left.bandwidthCoeff != right.bandwidthCoeff) {
         return left.bandwidthCoeff > right.bandwidthCoeff;
     }
-    if (left.staticLoadScore != right.staticLoadScore) {
-        return left.staticLoadScore > right.staticLoadScore;
-    }
     if (left.link.linkAttr.hop != right.link.linkAttr.hop) {
         return left.link.linkAttr.hop < right.link.linkAttr.hop;
     }
@@ -193,8 +178,34 @@ bool BetterLinkCandidate(const LinkCandidate &left, const LinkCandidate &right)
     return SymmetricLinkLess(left.link, right.link);
 }
 
-const char *SelectionReason(const LinkCandidate &selected, const LinkCandidate *runnerUp)
+bool SameLinkCapability(const LinkCandidate &left, const LinkCandidate &right)
 {
+    return ProtocolPriority(left.link.linkAttr.linkProtocol) ==
+            ProtocolPriority(right.link.linkAttr.linkProtocol) &&
+        left.bandwidthAvailable == right.bandwidthAvailable &&
+        (!left.bandwidthAvailable || left.bandwidthCoeff == right.bandwidthCoeff) &&
+        left.link.linkAttr.hop == right.link.linkAttr.hop &&
+        left.layer == right.layer && left.topology == right.topology;
+}
+
+uint64_t SymmetricRankPairKey(uint32_t rankA, uint32_t rankB)
+{
+    const uint64_t low = std::min(rankA, rankB);
+    const uint64_t high = std::max(rankA, rankB);
+    uint64_t value = (low << 32U) | high;
+    value ^= value >> 30U;
+    value *= 0xbf58476d1ce4e5b9ULL;
+    value ^= value >> 27U;
+    value *= 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+const char *SelectionReason(
+    const LinkCandidate &selected, const LinkCandidate *runnerUp, uint32_t balancedCandidateCount)
+{
+    if (balancedCandidateCount > 1) {
+        return "rank_pair_static_balance";
+    }
     if (runnerUp == nullptr) {
         return "only_candidate";
     }
@@ -205,9 +216,6 @@ const char *SelectionReason(const LinkCandidate &selected, const LinkCandidate *
     if (selected.bandwidthAvailable != runnerUp->bandwidthAvailable ||
         (selected.bandwidthAvailable && selected.bandwidthCoeff != runnerUp->bandwidthCoeff)) {
         return "bw_coeff";
-    }
-    if (selected.staticLoadScore != runnerUp->staticLoadScore) {
-        return "static_die_load";
     }
     if (selected.link.linkAttr.hop != runnerUp->link.linkAttr.hop) {
         return "hop";
@@ -255,12 +263,10 @@ HcclResult QueryBestCcuLinkToPeer(
             // and fall back to properties both endpoints observe identically.
             candidateDieMask |= 1U << candidate.localDie;
             HCCL_DEBUG("[BroadcastChannelCandidate] rank=%u peer=%u protocol=%s layer=%u topology=%s "
-                       "scope=%s localDie=%u remoteDie=%u bwCoeff=%u bwAvailable=%u loadScore=%u "
-                       "hop=%u channelKey=%016llx",
+                       "localDie=%u bwCoeff=%u bwAvailable=%u hop=%u channelKey=%016llx",
                 myRank, remoteRank, ProtocolName(protocol), candidate.layer,
-                TopologyName(candidate.topology), LinkScopeName(candidate.link), candidate.localDie,
-                candidate.remoteDie, candidate.bandwidthCoeff, candidate.bandwidthAvailable ? 1U : 0U,
-                candidate.staticLoadScore, candidate.link.linkAttr.hop,
+                TopologyName(candidate.topology), candidate.localDie, candidate.bandwidthCoeff,
+                candidate.bandwidthAvailable ? 1U : 0U, candidate.link.linkAttr.hop,
                 static_cast<unsigned long long>(SymmetricLinkKey(candidate.link)));
             candidates.push_back(candidate);
         }
@@ -270,21 +276,30 @@ HcclResult QueryBestCcuLinkToPeer(
         return HCCL_E_NOT_FOUND;
     }
     std::sort(candidates.begin(), candidates.end(), BetterLinkCandidate);
-    const LinkCandidate &selectedCandidate = candidates.front();
+    uint32_t balancedCandidateCount = 1;
+    while (balancedCandidateCount < candidates.size() &&
+        SameLinkCapability(candidates.front(), candidates[balancedCandidateCount])) {
+        ++balancedCandidateCount;
+    }
+    const uint32_t selectedIndex = static_cast<uint32_t>(
+        SymmetricRankPairKey(myRank, remoteRank) % balancedCandidateCount);
+    const LinkCandidate &selectedCandidate = candidates[selectedIndex];
     const CommLink &selected = selectedCandidate.link;
     localDieId = selectedCandidate.localDie;
     CHK_PRT_RET(localDieId >= BROADCAST_CCU_DIE_NUM,
         HCCL_ERROR("[QueryBestCcuLinkToPeer] invalid local die=%u", localDieId), HCCL_E_INTERNAL);
     if (LOG_LEVEL <= LOG_LEVEL_INFO) {
-        const LinkCandidate *runnerUp = candidates.size() > 1 ? &candidates[1] : nullptr;
-        HCCL_INFO("[BroadcastChannelDiag] rank=%u peer=%u protocol=%s layer=%u topology=%s scope=%s "
-            "localDie=%u remoteDie=%u bwCoeff=%u bwAvailable=%u loadScore=%u candidateCount=%zu "
-            "candidateDieMask=0x%x tieBreak=%s channelKey=%016llx",
+        const LinkCandidate *runnerUp = candidates.size() > balancedCandidateCount ?
+            &candidates[balancedCandidateCount] : nullptr;
+        const char *pathClass = selected.linkAttr.hop <= 1 ? "DIRECT" : "TRANSIT_ONLY";
+        HCCL_INFO("[BroadcastChannelDiag] rank=%u peer=%u protocol=%s layer=%u topology=%s path=%s "
+            "localDie=%u bwCoeff=%u bwAvailable=%u candidateCount=%zu balancedCandidateCount=%u "
+            "selectedIndex=%u candidateDieMask=0x%x tieBreak=%s channelKey=%016llx",
             myRank, remoteRank, ProtocolName(selected.linkAttr.linkProtocol), selectedCandidate.layer,
-            TopologyName(selectedCandidate.topology), LinkScopeName(selected), localDieId,
-            selectedCandidate.remoteDie, selectedCandidate.bandwidthCoeff,
-            selectedCandidate.bandwidthAvailable ? 1U : 0U, selectedCandidate.staticLoadScore,
-            candidates.size(), candidateDieMask, SelectionReason(selectedCandidate, runnerUp),
+            TopologyName(selectedCandidate.topology), pathClass, localDieId,
+            selectedCandidate.bandwidthCoeff, selectedCandidate.bandwidthAvailable ? 1U : 0U,
+            candidates.size(), balancedCandidateCount, selectedIndex, candidateDieMask,
+            SelectionReason(selectedCandidate, runnerUp, balancedCandidateCount),
             static_cast<unsigned long long>(SymmetricLinkKey(selected)));
     }
     CHK_RET(HcclChannelDescInit(&desc, 1));
