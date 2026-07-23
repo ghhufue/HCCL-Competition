@@ -36,7 +36,7 @@ constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t MAIN_THREAD_NOTIFY_NUM =
     1 + BROADCAST_SEGMENT_PIPELINE_DEPTH * BROADCAST_CCU_DIE_NUM * 2;
 constexpr uint32_t PUSH_THREAD_NOTIFY_NUM = 1 + BROADCAST_SEGMENT_PIPELINE_DEPTH;
-constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v17";
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v18";
 
 HcclResult ValidateBroadcastParam(const OpParam &param)
 {

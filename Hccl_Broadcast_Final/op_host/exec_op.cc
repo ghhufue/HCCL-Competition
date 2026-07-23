@@ -139,13 +139,31 @@ uint32_t ActiveDieCount(uint32_t dieMask)
     return count;
 }
 
-HcclResult StartPushThreads(
+uint32_t GetPrimaryDie(const OpParam &param, const AlgResourceCtx &resCtx)
+{
+    if (param.myRank != param.root) {
+        return resCtx.peerDieByRank[param.root];
+    }
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+            return dieId;
+        }
+    }
+    return BROADCAST_CCU_DIE_NUM;
+}
+
+uint32_t ControlDoneNotifyIndex(uint32_t dieId, uint32_t pushGroup)
+{
+    return 1 + dieId * 2 + pushGroup;
+}
+
+HcclResult StartPushThread(
     const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask)
 {
     const uint32_t expected = ActiveDieCount(dieMask);
-    CHK_PRT_RET(expected == 0 || expected > resCtx.pushThreadCount ||
+    CHK_PRT_RET(expected != 1 || expected > resCtx.pushThreadCount ||
             (dieMask & ~resCtx.activeDieMask) != 0,
-        HCCL_ERROR("[StartPushThreads] invalid dieMask=%u activeDieMask=%u pushThreadCount=%u",
+        HCCL_ERROR("[StartPushThread] invalid dieMask=%u activeDieMask=%u pushThreadCount=%u",
             dieMask, resCtx.activeDieMask, resCtx.pushThreadCount), HCCL_E_INTERNAL);
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
         if ((dieMask & (1U << dieId)) == 0) {
@@ -164,15 +182,20 @@ HcclResult StartPushThreads(
     return HCCL_SUCCESS;
 }
 
-HcclResult StartOwnerPushThreads(const OpParam &param, const AlgResourceCtx &resCtx)
+HcclResult StartOwnerWorkerThreads(
+    const OpParam &param, const AlgResourceCtx &resCtx, uint32_t primaryDie)
 {
-    const uint32_t expected = ActiveDieCount(resCtx.activeDieMask) + ActiveDieCount(resCtx.group1DieMask);
-    CHK_PRT_RET(expected == 0 || expected != resCtx.pushThreadCount ||
+    const uint32_t total = ActiveDieCount(resCtx.activeDieMask) + ActiveDieCount(resCtx.group1DieMask);
+    CHK_PRT_RET(primaryDie >= BROADCAST_CCU_DIE_NUM ||
+            (resCtx.activeDieMask & (1U << primaryDie)) == 0 ||
+            total == 0 || total != resCtx.pushThreadCount ||
             (resCtx.group1DieMask & ~resCtx.activeDieMask) != 0,
-        HCCL_ERROR("[StartOwnerPushThreads] invalid activeDieMask=%u group1DieMask=%u pushThreadCount=%u",
-            resCtx.activeDieMask, resCtx.group1DieMask, resCtx.pushThreadCount), HCCL_E_INTERNAL);
+        HCCL_ERROR("[StartOwnerWorkerThreads] invalid primaryDie=%u activeDieMask=%u "
+                   "group1DieMask=%u pushThreadCount=%u",
+            primaryDie, resCtx.activeDieMask, resCtx.group1DieMask, resCtx.pushThreadCount),
+        HCCL_E_INTERNAL);
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0 && dieId != primaryDie) {
             CHK_RET(HcommThreadNotifyRecordOnThread(
                 param.cpuThread, resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX));
         }
@@ -182,7 +205,7 @@ HcclResult StartOwnerPushThreads(const OpParam &param, const AlgResourceCtx &res
         }
     }
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0 && dieId != primaryDie) {
             CHK_RET(HcommThreadNotifyWaitOnThread(
                 resCtx.pushThreads[dieId], THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
         }
@@ -220,12 +243,12 @@ HcclResult LaunchKernel(ThreadHandle thread, const OpParam &param, CcuKernelHand
     return HCCL_SUCCESS;
 }
 
-HcclResult JoinPushThreads(
+HcclResult JoinPushThread(
     const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask)
 {
     const uint32_t expected = ActiveDieCount(dieMask);
-    CHK_PRT_RET(expected == 0 || expected > resCtx.pushThreadCount,
-        HCCL_ERROR("[JoinPushThreads] invalid dieMask=%u pushThreadCount=%u", dieMask, resCtx.pushThreadCount),
+    CHK_PRT_RET(expected != 1 || expected > resCtx.pushThreadCount,
+        HCCL_ERROR("[JoinPushThread] invalid dieMask=%u pushThreadCount=%u", dieMask, resCtx.pushThreadCount),
         HCCL_E_INTERNAL);
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
         if ((dieMask & (1U << dieId)) == 0) {
@@ -240,24 +263,34 @@ HcclResult JoinPushThreads(
     return HCCL_SUCCESS;
 }
 
-HcclResult JoinOwnerPushThreads(const OpParam &param, const AlgResourceCtx &resCtx)
+HcclResult JoinOwnerWorkerThreads(
+    const OpParam &param, const AlgResourceCtx &resCtx, uint32_t primaryDie)
 {
-    const uint32_t expected = ActiveDieCount(resCtx.activeDieMask) + ActiveDieCount(resCtx.group1DieMask);
-    CHK_PRT_RET(expected == 0 || expected != resCtx.pushThreadCount,
-        HCCL_ERROR("[JoinOwnerPushThreads] invalid pushThreadCount=%u expected=%u",
-            resCtx.pushThreadCount, expected), HCCL_E_INTERNAL);
+    const uint32_t total = ActiveDieCount(resCtx.activeDieMask) + ActiveDieCount(resCtx.group1DieMask);
+    CHK_PRT_RET(primaryDie >= BROADCAST_CCU_DIE_NUM ||
+            (resCtx.activeDieMask & (1U << primaryDie)) == 0 ||
+            total == 0 || total != resCtx.pushThreadCount,
+        HCCL_ERROR("[JoinOwnerWorkerThreads] invalid primaryDie=%u pushThreadCount=%u total=%u",
+            primaryDie, resCtx.pushThreadCount, total), HCCL_E_INTERNAL);
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0 && dieId != primaryDie) {
+            CHK_RET(HcommThreadNotifyWaitOnThread(
+                param.cpuThread, ControlDoneNotifyIndex(dieId, 0), CUSTOM_TIMEOUT));
+        }
+        if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
+            CHK_RET(HcommThreadNotifyWaitOnThread(
+                param.cpuThread, ControlDoneNotifyIndex(dieId, 1), CUSTOM_TIMEOUT));
+        }
+    }
+    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0 && dieId != primaryDie) {
             CHK_RET(HcommThreadNotifyRecordOnThread(
-                resCtx.pushThreads[dieId], param.cpuThread, THREAD_NOTIFY_INDEX));
+                resCtx.pushThreads[dieId], param.cpuThread, ControlDoneNotifyIndex(dieId, 0)));
         }
         if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
             CHK_RET(HcommThreadNotifyRecordOnThread(
-                resCtx.pushGroup1Threads[dieId], param.cpuThread, THREAD_NOTIFY_INDEX));
+                resCtx.pushGroup1Threads[dieId], param.cpuThread, ControlDoneNotifyIndex(dieId, 1)));
         }
-    }
-    for (uint32_t i = 0; i < expected; ++i) {
-        CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread, THREAD_NOTIFY_INDEX, CUSTOM_TIMEOUT));
     }
     return HCCL_SUCCESS;
 }
@@ -265,8 +298,12 @@ HcclResult JoinOwnerPushThreads(const OpParam &param, const AlgResourceCtx &resC
 HcclResult LaunchOwnerPushGroups(const OpParam &param, const AlgResourceCtx &resCtx,
     uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk, uint64_t phase)
 {
+    const uint32_t primaryDie = GetPrimaryDie(param, resCtx);
+    CHK_RET(StartOwnerWorkerThreads(param, resCtx, primaryDie));
+    CHK_RET(LaunchKernel(param.cpuThread, param, resCtx.ownerWriteKernels[primaryDie],
+        baseAddr, token, chunk, phase, true));
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
+        if ((resCtx.activeDieMask & (1U << dieId)) != 0 && dieId != primaryDie) {
             CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, resCtx.ownerWriteKernels[dieId],
                 baseAddr, token, chunk, phase, true));
         }
@@ -275,26 +312,45 @@ HcclResult LaunchOwnerPushGroups(const OpParam &param, const AlgResourceCtx &res
                 baseAddr, token, chunk, phase, true));
         }
     }
-    return JoinOwnerPushThreads(param, resCtx);
+    return JoinOwnerWorkerThreads(param, resCtx, primaryDie);
 }
 
-HcclResult LaunchPhaseOnPushThreads(const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask,
+HcclResult LaunchPhaseHybrid(const OpParam &param, const AlgResourceCtx &resCtx, uint32_t dieMask,
     const CcuKernelHandle (&kernels)[BROADCAST_CCU_DIE_NUM], uint64_t baseAddr, uint64_t token,
     const ChunkDesc &chunk, uint64_t phase, bool ownerWriteArgs)
 {
     CHK_PRT_RET(dieMask == 0 || (dieMask & ~resCtx.activeDieMask) != 0,
-        HCCL_ERROR("[LaunchPhaseOnPushThreads] invalid dieMask=%u activeDieMask=%u",
+        HCCL_ERROR("[LaunchPhaseHybrid] invalid dieMask=%u activeDieMask=%u",
             dieMask, resCtx.activeDieMask), HCCL_E_INTERNAL);
+    uint32_t primaryDie = GetPrimaryDie(param, resCtx);
+    if (primaryDie >= BROADCAST_CCU_DIE_NUM || (dieMask & (1U << primaryDie)) == 0) {
+        for (primaryDie = 0; primaryDie < BROADCAST_CCU_DIE_NUM; ++primaryDie) {
+            if ((dieMask & (1U << primaryDie)) != 0) {
+                break;
+            }
+        }
+    }
+    CHK_PRT_RET(primaryDie >= BROADCAST_CCU_DIE_NUM || kernels[primaryDie] == 0,
+        HCCL_ERROR("[LaunchPhaseHybrid] missing primary resource for die=%u", primaryDie),
+        HCCL_E_INTERNAL);
+    // Keep one CCU mission on the stream-bound thread so the runner always has
+    // a progressing entry stream; only the second Die is dispatched in parallel.
+    const uint32_t workerMask = dieMask & ~(1U << primaryDie);
+    if (workerMask != 0) {
+        CHK_RET(StartPushThread(param, resCtx, workerMask));
+    }
+    CHK_RET(LaunchKernel(param.cpuThread, param, kernels[primaryDie],
+        baseAddr, token, chunk, phase, ownerWriteArgs));
     for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((dieMask & (1U << dieId)) == 0) {
+        if ((workerMask & (1U << dieId)) == 0) {
             continue;
         }
         CHK_PRT_RET(resCtx.pushThreads[dieId] == 0 || kernels[dieId] == 0,
-            HCCL_ERROR("[LaunchPhaseOnPushThreads] missing resource for die=%u", dieId), HCCL_E_INTERNAL);
+            HCCL_ERROR("[LaunchPhaseHybrid] missing resource for die=%u", dieId), HCCL_E_INTERNAL);
         CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, kernels[dieId],
             baseAddr, token, chunk, phase, ownerWriteArgs));
     }
-    return JoinPushThreads(param, resCtx, dieMask);
+    return workerMask == 0 ? HCCL_SUCCESS : JoinPushThread(param, resCtx, workerMask);
 }
 
 HcclResult GetSmallPullDieMask(const OpParam &param, const AlgResourceCtx &resCtx, uint32_t &dieMask)
@@ -313,15 +369,7 @@ HcclResult GetSmallPullDieMask(const OpParam &param, const AlgResourceCtx &resCt
 
 uint32_t GetSeedDie(const OpParam &param, const AlgResourceCtx &resCtx)
 {
-    if (param.myRank != param.root) {
-        return resCtx.peerDieByRank[param.root];
-    }
-    for (uint32_t dieId = 0; dieId < BROADCAST_CCU_DIE_NUM; ++dieId) {
-        if ((resCtx.activeDieMask & (1U << dieId)) != 0) {
-            return dieId;
-        }
-    }
-    return BROADCAST_CCU_DIE_NUM;
+    return GetPrimaryDie(param, resCtx);
 }
 
 uint32_t SegmentReadyNotifyIndex(uint32_t slot)
@@ -370,18 +418,20 @@ HcclResult SubmitOwnerSegment(const OpParam &param, const AlgResourceCtx &resCtx
             continue;
         }
         const uint32_t readyNotifyIndex = SegmentReadyNotifyIndex(segment.readyRingIndex);
-        CHK_RET(HcommThreadNotifyRecordOnThread(
-            param.cpuThread, resCtx.pushThreads[dieId], readyNotifyIndex));
-        CHK_RET(HcommThreadNotifyWaitOnThread(
-            resCtx.pushThreads[dieId], readyNotifyIndex, CUSTOM_TIMEOUT));
-        const CcuKernelHandle pushKernel = resCtx.ownerWriteKernels[dieId];
-        CHK_PRT_RET(pushKernel == 0,
-            HCCL_ERROR("[SubmitOwnerSegment] missing group-0 Push kernel for die=%u", dieId),
-            HCCL_E_INTERNAL);
-        CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, pushKernel,
-            baseAddr, token, segment, OWNER_WRITE_PHASE_COUNT, true));
-        CHK_RET(HcommThreadNotifyRecordOnThread(resCtx.pushThreads[dieId], param.cpuThread,
-            SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 0)));
+        if (dieId != seedDie) {
+            CHK_RET(HcommThreadNotifyRecordOnThread(
+                param.cpuThread, resCtx.pushThreads[dieId], readyNotifyIndex));
+            CHK_RET(HcommThreadNotifyWaitOnThread(
+                resCtx.pushThreads[dieId], readyNotifyIndex, CUSTOM_TIMEOUT));
+            const CcuKernelHandle pushKernel = resCtx.ownerWriteKernels[dieId];
+            CHK_PRT_RET(pushKernel == 0,
+                HCCL_ERROR("[SubmitOwnerSegment] missing group-0 Push kernel for die=%u", dieId),
+                HCCL_E_INTERNAL);
+            CHK_RET(LaunchKernel(resCtx.pushThreads[dieId], param, pushKernel,
+                baseAddr, token, segment, OWNER_WRITE_PHASE_COUNT, true));
+            CHK_RET(HcommThreadNotifyRecordOnThread(resCtx.pushThreads[dieId], param.cpuThread,
+                SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 0)));
+        }
         if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
             CHK_RET(HcommThreadNotifyRecordOnThread(
                 param.cpuThread, resCtx.pushGroup1Threads[dieId], readyNotifyIndex));
@@ -396,7 +446,8 @@ HcclResult SubmitOwnerSegment(const OpParam &param, const AlgResourceCtx &resCtx
                 SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 1)));
         }
     }
-    return HCCL_SUCCESS;
+    return LaunchKernel(param.cpuThread, param, resCtx.ownerWriteKernels[seedDie],
+        baseAddr, token, segment, OWNER_WRITE_PHASE_COUNT, true);
 }
 
 HcclResult DrainOwnerSegment(const OpParam &param, const AlgResourceCtx &resCtx,
@@ -408,8 +459,10 @@ HcclResult DrainOwnerSegment(const OpParam &param, const AlgResourceCtx &resCtx,
         if ((resCtx.activeDieMask & (1U << dieId)) == 0) {
             continue;
         }
-        CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread,
-            SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 0), CUSTOM_TIMEOUT));
+        if (dieId != GetPrimaryDie(param, resCtx)) {
+            CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread,
+                SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 0), CUSTOM_TIMEOUT));
+        }
         if ((resCtx.group1DieMask & (1U << dieId)) != 0) {
             CHK_RET(HcommThreadNotifyWaitOnThread(param.cpuThread,
                 SegmentDoneNotifyIndex(segment.readyRingIndex, dieId, 1), CUSTOM_TIMEOUT));
@@ -450,7 +503,7 @@ HcclResult LaunchSegmentedOwnerPipeline(const OpParam &param, const AlgResourceC
             CHK_RET(DrainOwnerSegment(param, resCtx, inFlight[slot]));
         }
     }
-    return JoinOwnerPushThreads(param, resCtx);
+    return HCCL_SUCCESS;
 }
 
 } // namespace
@@ -502,9 +555,8 @@ HcclResult LaunchSmallReceiverPullChunk(
 {
     uint32_t dieMask = 0;
     CHK_RET(GetSmallPullDieMask(param, resCtx, dieMask));
-    CHK_RET(StartPushThreads(param, resCtx, dieMask));
     for (uint32_t phase = 0; phase < SMALL_PULL_PHASE_COUNT; ++phase) {
-        CHK_RET(LaunchPhaseOnPushThreads(param, resCtx, dieMask, resCtx.smallPullKernels,
+        CHK_RET(LaunchPhaseHybrid(param, resCtx, dieMask, resCtx.smallPullKernels,
             baseAddr, token, chunk, phase, false));
     }
     return HCCL_SUCCESS;
@@ -513,7 +565,6 @@ HcclResult LaunchSmallReceiverPullChunk(
 HcclResult LaunchContiguousOwnerWriteChunk(
     const OpParam &param, const AlgResourceCtx &resCtx, uint64_t baseAddr, uint64_t token, const ChunkDesc &chunk)
 {
-    CHK_RET(StartOwnerPushThreads(param, resCtx));
     CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
         static_cast<uint64_t>(OwnerWritePhase::PRESYNC_PUBLISH)));
     CHK_RET(LaunchOwnerPushGroups(param, resCtx, baseAddr, token, chunk,
