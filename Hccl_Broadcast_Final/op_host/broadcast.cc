@@ -36,7 +36,7 @@ constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t MAIN_THREAD_NOTIFY_NUM =
     1 + BROADCAST_SEGMENT_PIPELINE_DEPTH * BROADCAST_CCU_DIE_NUM * 2;
 constexpr uint32_t PUSH_THREAD_NOTIFY_NUM = 1 + BROADCAST_SEGMENT_PIPELINE_DEPTH;
-constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v18";
+constexpr char RESOURCE_TAG[] = "hccl_custom_broadcast_v22";
 
 HcclResult ValidateBroadcastParam(const OpParam &param)
 {
@@ -488,12 +488,8 @@ HcclResult RegisterBroadcastKernels(HcclComm comm, const OpParam &param,
                     param, channelsByDie[dieId], remoteRanksByDie[dieId], dieId, seedDie,
                     resCtx.activeDieMask, config, 1, true);
                 group1Arg->pushWindowDepth = 1;
-                const char *group1KernelName = rootOwner ? "CcuBroadcastRootOwnerWriteGroup1Kernel" :
-                                                          "CcuBroadcastOwnerControlGroup1Kernel";
-                void *group1KernelFunc = rootOwner ?
-                    reinterpret_cast<void *>(ops_hccl::CcuBroadcastRootOwnerWriteKernel) :
-                    reinterpret_cast<void *>(ops_hccl::CcuBroadcastOwnerControlKernel);
-                ret = RegisterOneKernel(insHandle, dieId, group1KernelName, group1KernelFunc,
+                ret = RegisterOneKernel(insHandle, dieId, "CcuBroadcastOwnerPushControlGroup1Kernel",
+                    reinterpret_cast<void *>(ops_hccl::CcuBroadcastOwnerSegmentPushKernel),
                     group1Arg, resCtx.segmentPushKernels[dieId]);
             }
             if (ret == HCCL_SUCCESS && !rootOwner && !useSegmentPipeline && dieId == seedDie) {

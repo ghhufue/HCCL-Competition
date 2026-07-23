@@ -753,8 +753,17 @@ CcuResult CcuBroadcastOwnerSegmentPushKernel(CcuKernelArg arg)
     BroadcastContext ctx;
     CCU_CHK_RET(InitBroadcastResource(ctx, kernelArg));
     CCU_CHK_RET(LoadOwnerWriteArgs(ctx));
+    CCU_CHK_RET(RunOwnerWriteControlPhase(ctx, kernelArg));
     CCU_IF(ctx.kernelPhase == OWNER_WRITE_PHASE_COUNT) {
-        CCU_CHK_RET(RunPushWithConfiguredDepth<false>(ctx, kernelArg));
+        // Group 1 shares a Die's 400 continuous-XN budget with the group-0
+        // kernel. Its source segment is fully ready before this launch, so one
+        // batched Write keeps the parallel path while avoiding rolling-window
+        // state that would make registration exceed that budget.
+        ccu::Variable offset;
+        ccu::Event pushEvent;
+        offset = 0;
+        CCU_CHK_RET((SubmitOwnerWritesNoWait<1>(ctx, offset, ctx.ownerBytes, pushEvent)));
+        CCU_CHK_RET((WaitOwnerWriteBatch<1>(ctx, pushEvent)));
     }
     return CCU_SUCCESS;
 }
